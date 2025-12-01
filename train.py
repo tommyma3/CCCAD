@@ -12,7 +12,7 @@ import torch
 from torch.optim import AdamW
 from torch.utils.tensorboard import SummaryWriter
 
-from dataset import ADDataset
+from dataset import ADDataset, ADCompressedDataset, collate_compressed_batch
 from env import SAMPLE_ENVIRONMENT
 from model import MODEL
 from utils import get_config, get_data_loader, log_in_context, next_dataloader
@@ -50,9 +50,9 @@ if __name__ == '__main__':
         exit(0)        
 
     config['traj_dir'] = './datasets'
-    config['mixed_precision'] = 'fp32'
+    config['mixed_precision'] = 'fp16'
 
-    accelerator = Accelerator(mixed_precision='no')
+    accelerator = Accelerator(mixed_precision=config['mixed_precision'])
     config['device'] = accelerator.device
     print('Using Device: ', config['device'])
 
@@ -62,13 +62,40 @@ if __name__ == '__main__':
     load_start_time = datetime.now()
     print(f'Data loading started at {load_start_time}')
 
-    train_dataset = ADDataset(config, config['traj_dir'], 'train', config['train_n_stream'], config['train_source_timesteps'])
-    test_dataset = ADDataset(config, config['traj_dir'], 'test', 1, config['train_source_timesteps'])
+    # Use compressed dataset for CompressedAD model
+    if model_name == 'CompressedAD':
+        train_dataset = ADCompressedDataset(config, config['traj_dir'], 'train', config['train_n_stream'], config['train_source_timesteps'])
+        test_dataset = ADCompressedDataset(config, config['traj_dir'], 'test', 1, config['train_source_timesteps'])
+        
+        # Use custom collate function for compressed dataset
+        from torch.utils.data import DataLoader
+        train_dataloader = DataLoader(
+            train_dataset,
+            batch_size=config['train_batch_size'],
+            shuffle=True,
+            num_workers=config['num_workers'],
+            collate_fn=collate_compressed_batch,
+            pin_memory=True
+        )
+        train_dataloader = next_dataloader(train_dataloader)
+        
+        test_dataloader = DataLoader(
+            test_dataset,
+            batch_size=config['test_batch_size'],
+            shuffle=False,
+            num_workers=config['num_workers'],
+            collate_fn=collate_compressed_batch,
+            pin_memory=True
+        )
+    else:
+        # Standard AD dataset
+        train_dataset = ADDataset(config, config['traj_dir'], 'train', config['train_n_stream'], config['train_source_timesteps'])
+        test_dataset = ADDataset(config, config['traj_dir'], 'test', 1, config['train_source_timesteps'])
 
-    train_dataloader = get_data_loader(train_dataset, batch_size=config['train_batch_size'], config=config, shuffle=True)
-    train_dataloader = next_dataloader(train_dataloader)
+        train_dataloader = get_data_loader(train_dataset, batch_size=config['train_batch_size'], config=config, shuffle=True)
+        train_dataloader = next_dataloader(train_dataloader)
 
-    test_dataloader = get_data_loader(test_dataset, batch_size=config['test_batch_size'], config=config, shuffle=False)
+        test_dataloader = get_data_loader(test_dataset, batch_size=config['test_batch_size'], config=config, shuffle=False)
     
     load_end_time = datetime.now()
     print()

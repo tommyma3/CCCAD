@@ -53,7 +53,9 @@ if __name__ == '__main__':
 
     start_time = datetime.now()
     print(f'Starting at {start_time}')
-
+    
+    # For CompressedAD: automatic hierarchical compression during evaluation
+    # When sequence length exceeds max, encoder compresses context into latents
     with torch.no_grad():
         test_rewards = model.evaluate_in_context(vec_env=envs, eval_timesteps=config['horizon'] * 500)['reward_episode']
         path = path.join(ckpt_dir, 'eval_result.npy')

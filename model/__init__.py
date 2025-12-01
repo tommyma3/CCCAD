@@ -1,5 +1,7 @@
 from .ad import AD
+from .ad_compressed import CompressedAD
 
 MODEL = {
-    "AD": AD
+    "AD": AD,
+    "CompressedAD": CompressedAD
 }

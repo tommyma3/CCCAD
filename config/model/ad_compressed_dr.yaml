@@ -1,0 +1,39 @@
+include: config/model/ad_base.yaml
+
+model: CompressedAD
+
+# Transformer Decoder
+tf_n_embd: 64
+tf_n_layer: 4
+tf_n_head: 4
+tf_dropout: 0.1
+tf_attn_dropout: 0.1
+tf_dim_feedforward: 256
+decoder_max_seq_length: 100  # Max sequence length for decoder before compression
+
+# Compression Encoder
+encoder_n_layer: 3  # Encoder can be smaller/same/larger than decoder
+encoder_n_head: 4
+encoder_dim_feedforward: 256
+max_encoder_length: 512  # Max input length to encoder (latents + context)
+n_latent: 60  # Number of latent tokens output by encoder
+
+# Compression parameters for dataset
+max_compression_depth: 3  # Maximum compression cycles (0-3)
+min_compress_length: 10  # Min timesteps to compress in each stage
+max_compress_length: 50  # Max timesteps to compress in each stage
+min_uncompressed_length: 5  # Min recent context to keep uncompressed
+max_uncompressed_length: 30  # Max recent context to keep uncompressed
+
+# Context window (for AD compatibility)
+n_transit: 240  
+
+# Training
+lr: 0.0003  
+train_batch_size: 256  # Smaller batch for compressed model (more complex)
+test_batch_size: 512
+train_source_timesteps: 1000
+train_timesteps: 100000  # More steps for compression learning
+num_warmup_steps: 2000  
+
+num_workers: 4
