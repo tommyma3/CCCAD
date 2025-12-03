@@ -295,85 +295,105 @@ def collate_compressed_batch(batch):
     Custom collate function for ADCompressedDataset.
     
     Handles variable-length compression stages by batching them appropriately.
+    For samples with different compression depths, we pad with dummy stages.
     """
     batch_size = len(batch)
     max_stages = max(item['num_compression_stages'] for item in batch)
     
-    # Initialize lists for each compression stage
-    compression_stages = [[] for _ in range(max_stages)] if max_stages > 0 else []
-    
-    uncompressed_contexts = []
+    # Separate batches by number of stages for proper processing
+    # All samples will be processed to have the same max_stages
     query_states_list = []
     target_actions_list = []
-    num_stages_list = []
+    
+    # Organize compression stages - ensure all samples have max_stages
+    all_compression_stages = []
+    all_uncompressed = []
     
     for item in batch:
         num_stages = item['num_compression_stages']
-        num_stages_list.append(num_stages)
         
-        # Collect compression stages
-        for stage_idx in range(num_stages):
-            stage_data = item['compression_stages'][stage_idx]
-            compression_stages[stage_idx].append(stage_data)
+        # For this sample, collect its stages (may be 0 to max_stages)
+        sample_stages = []
+        if num_stages > 0:
+            sample_stages = item['compression_stages']
         
-        # Pad with None for samples with fewer stages
-        for stage_idx in range(num_stages, max_stages):
-            compression_stages[stage_idx].append(None)
+        # Pad with None if this sample has fewer stages than max
+        while len(sample_stages) < max_stages:
+            sample_stages.append(None)
         
-        uncompressed_contexts.append(item['uncompressed_context'])
+        all_compression_stages.append(sample_stages)
+        all_uncompressed.append(item['uncompressed_context'])
         query_states_list.append(item['query_states'])
         target_actions_list.append(item['target_actions'])
     
-    # Stack tensors for each stage
+    # Now batch each stage separately
     batched_stages = []
     for stage_idx in range(max_stages):
-        stage_batch = [s for s in compression_stages[stage_idx] if s is not None]
-        if len(stage_batch) > 0:
-            # Find max length in this stage
-            max_len = max(s['states'].shape[0] for s in stage_batch)
-            
-            # Pad and stack
-            batched_stage = {
-                'states': [],
-                'actions': [],
-                'rewards': [],
-                'next_states': []
-            }
-            
-            for s in stage_batch:
-                seq_len = s['states'].shape[0]
+        # Collect all samples' data for this stage
+        stage_samples = [all_compression_stages[i][stage_idx] for i in range(batch_size)]
+        
+        # Filter out None (samples that don't have this stage)
+        valid_samples = [s for s in stage_samples if s is not None]
+        
+        if len(valid_samples) == 0:
+            # No samples have this stage, skip
+            continue
+        
+        # Find max length in this stage across valid samples
+        max_len = max(s['states'].shape[0] for s in valid_samples)
+        
+        # For samples without this stage, we need to create dummy data
+        # with the same batch size as the full batch
+        batched_stage = {
+            'states': [],
+            'actions': [],
+            'rewards': [],
+            'next_states': []
+        }
+        
+        for sample in stage_samples:
+            if sample is None:
+                # This sample doesn't have this compression stage
+                # Add dummy data with max_len (will be ignored by model if needed)
+                batched_stage['states'].append(torch.zeros(max_len, *valid_samples[0]['states'].shape[1:]))
+                batched_stage['actions'].append(torch.zeros(max_len, *valid_samples[0]['actions'].shape[1:]))
+                batched_stage['rewards'].append(torch.zeros(max_len))
+                batched_stage['next_states'].append(torch.zeros(max_len, *valid_samples[0]['next_states'].shape[1:]))
+            else:
+                # Pad to max_len if needed
+                seq_len = sample['states'].shape[0]
                 if seq_len < max_len:
                     pad_len = max_len - seq_len
                     batched_stage['states'].append(torch.cat([
-                        s['states'], 
-                        torch.zeros(pad_len, *s['states'].shape[1:])
+                        sample['states'], 
+                        torch.zeros(pad_len, *sample['states'].shape[1:])
                     ]))
                     batched_stage['actions'].append(torch.cat([
-                        s['actions'],
-                        torch.zeros(pad_len, *s['actions'].shape[1:])
+                        sample['actions'],
+                        torch.zeros(pad_len, *sample['actions'].shape[1:])
                     ]))
                     batched_stage['rewards'].append(torch.cat([
-                        s['rewards'],
+                        sample['rewards'],
                         torch.zeros(pad_len)
                     ]))
                     batched_stage['next_states'].append(torch.cat([
-                        s['next_states'],
-                        torch.zeros(pad_len, *s['next_states'].shape[1:])
+                        sample['next_states'],
+                        torch.zeros(pad_len, *sample['next_states'].shape[1:])
                     ]))
                 else:
-                    batched_stage['states'].append(s['states'])
-                    batched_stage['actions'].append(s['actions'])
-                    batched_stage['rewards'].append(s['rewards'])
-                    batched_stage['next_states'].append(s['next_states'])
-            
-            # Stack into batch dimension
-            batched_stage = {
-                k: torch.stack(v) for k, v in batched_stage.items()
-            }
-            batched_stages.append(batched_stage)
+                    batched_stage['states'].append(sample['states'])
+                    batched_stage['actions'].append(sample['actions'])
+                    batched_stage['rewards'].append(sample['rewards'])
+                    batched_stage['next_states'].append(sample['next_states'])
+        
+        # Stack into batch dimension
+        batched_stage = {
+            k: torch.stack(v) for k, v in batched_stage.items()
+        }
+        batched_stages.append(batched_stage)
     
     # Batch uncompressed context
-    max_uncomp_len = max(c['states'].shape[0] for c in uncompressed_contexts)
+    max_uncomp_len = max(c['states'].shape[0] for c in all_uncompressed)
     batched_uncompressed = {
         'states': [],
         'actions': [],
@@ -381,7 +401,7 @@ def collate_compressed_batch(batch):
         'next_states': []
     }
     
-    for c in uncompressed_contexts:
+    for c in all_uncompressed:
         seq_len = c['states'].shape[0]
         if seq_len < max_uncomp_len:
             pad_len = max_uncomp_len - seq_len
