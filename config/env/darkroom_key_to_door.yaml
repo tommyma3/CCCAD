@@ -1,0 +1,12 @@
+env: darkroomkeytodoor
+grid_size: 9
+dim_states: 2
+dim_actions: 1
+num_actions: 5
+
+horizon: 50
+env_split_seed: 4
+
+train_env_ratio: 0.95
+
+max_reward: 2
