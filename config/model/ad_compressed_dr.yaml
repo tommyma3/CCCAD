@@ -9,7 +9,7 @@ tf_n_head: 4
 tf_dropout: 0.1
 tf_attn_dropout: 0.1
 tf_dim_feedforward: 256
-decoder_max_seq_length: 100  # Max sequence length for decoder before compression
+decoder_max_seq_length: 240  # Max sequence length for decoder before compression
 
 # Compression Encoder
 encoder_n_layer: 3  # Encoder can be smaller/same/larger than decoder
@@ -23,7 +23,7 @@ max_compression_depth: 3  # Maximum compression cycles (0-3)
 min_compress_length: 10  # Min timesteps to compress in each stage
 max_compress_length: 50  # Max timesteps to compress in each stage
 min_uncompressed_length: 5  # Min recent context to keep uncompressed
-max_uncompressed_length: 30  # Max recent context to keep uncompressed
+max_uncompressed_length: 180  # Max recent context to keep uncompressed
 
 # Context window (for AD compatibility)
 n_transit: 240  
