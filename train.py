@@ -180,7 +180,13 @@ if __name__ == '__main__':
 
                     for j, batch in enumerate(test_dataloader):
                         output = model(batch)
-                        cnt = len(batch['states'])
+                        
+                        # Handle both standard AD and CompressedAD batch formats
+                        if 'states' in batch:
+                            cnt = len(batch['states'])
+                        else:
+                            cnt = len(batch['query_states'])
+                        
                         test_loss_action += output['loss_action'].item() * cnt
                         test_acc_action += output['acc_action'].item() * cnt
                             
