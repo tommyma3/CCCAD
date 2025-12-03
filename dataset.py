@@ -221,9 +221,22 @@ class ADCompressedDataset(Dataset):
         """
         end_idx = start_idx + length
         
+        actions_data = self.actions[history_idx, start_idx:end_idx]
+        
+        # Check if actions are already one-hot encoded (2D) or need encoding (1D)
+        if len(actions_data.shape) == 1:
+            # Actions are indices, need to one-hot encode
+            num_actions = self.config.get('num_actions', 5)
+            actions_onehot = np.zeros((length, num_actions), dtype=np.float32)
+            actions_onehot[np.arange(length), actions_data.astype(int)] = 1.0
+            actions_tensor = torch.tensor(actions_onehot, dtype=torch.float32)
+        else:
+            # Actions are already one-hot encoded
+            actions_tensor = torch.tensor(actions_data, dtype=torch.float32)
+        
         return {
             'states': torch.tensor(self.states[history_idx, start_idx:end_idx], dtype=torch.float32),
-            'actions': torch.tensor(self.actions[history_idx, start_idx:end_idx], dtype=torch.float32),
+            'actions': actions_tensor,
             'rewards': torch.tensor(self.rewards[history_idx, start_idx:end_idx], dtype=torch.float32),
             'next_states': torch.tensor(self.next_states[history_idx, start_idx:end_idx], dtype=torch.float32)
         }

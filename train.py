@@ -29,7 +29,7 @@ if __name__ == '__main__':
     
     config = get_config('./config/env/darkroom.yaml')
     config.update(get_config('./config/algorithm/ppo_darkroom.yaml'))
-    config.update(get_config('./config/model/ad_dr.yaml'))
+    config.update(get_config('./config/model/ad_compressed_dr.yaml'))  # Use CompressedAD config
 
     log_dir = path.join('./runs', f"{config['model']}-{config['env']}-seed{config['env_split_seed']}")
     
