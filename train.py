@@ -67,23 +67,38 @@ if __name__ == '__main__':
         train_dataset = ADCompressedDataset(config, config['traj_dir'], 'train', config['train_n_stream'], config['train_source_timesteps'])
         test_dataset = ADCompressedDataset(config, config['traj_dir'], 'test', 1, config['train_source_timesteps'])
         
-        # Use custom collate function for compressed dataset
+        # Use custom collate function and bucket sampler for compressed dataset
         from torch.utils.data import DataLoader
-        train_dataloader = DataLoader(
+        from dataset import BucketSampler
+        
+        # BucketSampler groups samples by compression depth
+        train_sampler = BucketSampler(
             train_dataset,
             batch_size=config['train_batch_size'],
             shuffle=True,
-            num_workers=config['num_workers'],
+            drop_last=False
+        )
+        
+        train_dataloader = DataLoader(
+            train_dataset,
+            batch_sampler=train_sampler,
+            num_workers=0,  # Use 0 workers with batch_sampler to avoid multiprocessing issues
             collate_fn=collate_compressed_batch,
             pin_memory=True
         )
         train_dataloader = next_dataloader(train_dataloader)
         
-        test_dataloader = DataLoader(
+        test_sampler = BucketSampler(
             test_dataset,
             batch_size=config['test_batch_size'],
             shuffle=False,
-            num_workers=config['num_workers'],
+            drop_last=False
+        )
+        
+        test_dataloader = DataLoader(
+            test_dataset,
+            batch_sampler=test_sampler,
+            num_workers=0,  # Use 0 workers with batch_sampler to avoid multiprocessing issues
             collate_fn=collate_compressed_batch,
             pin_memory=True
         )

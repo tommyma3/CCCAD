@@ -1,4 +1,5 @@
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
+from collections import defaultdict
 import numpy as np
 from utils import get_traj_file_name
 import h5py
@@ -253,11 +254,20 @@ class ADCompressedDataset(Dataset):
             target_idx = sample_info['target_idx']
             uncompressed_length = target_idx - uncompressed_start
             
+            # Handle target action - convert one-hot to index if needed
+            target_action_data = self.actions[history_idx, target_idx]
+            if len(target_action_data.shape) == 1 and target_action_data.shape[0] > 1:
+                # One-hot encoded, convert to index
+                target_action = torch.tensor(np.argmax(target_action_data), dtype=torch.long)
+            else:
+                # Already an index
+                target_action = torch.tensor(target_action_data, dtype=torch.long)
+            
             return {
                 'compression_stages': [],
                 'uncompressed_context': self._get_context_dict(history_idx, uncompressed_start, uncompressed_length),
                 'query_states': torch.tensor(self.states[history_idx, target_idx], dtype=torch.float32),
-                'target_actions': torch.tensor(self.actions[history_idx, target_idx], dtype=torch.long),
+                'target_actions': target_action,
                 'num_compression_stages': 0
             }
         else:
@@ -277,15 +287,23 @@ class ADCompressedDataset(Dataset):
             uncompressed_context = self._get_context_dict(history_idx, current_idx, uncomp_len)
             current_idx += uncomp_len
             
-            # Query state and target
+            # Query state and target action
             query_states = torch.tensor(self.states[history_idx, current_idx], dtype=torch.float32)
-            target_actions = torch.tensor(self.actions[history_idx, current_idx], dtype=torch.long)
+            
+            # Handle target action - convert one-hot to index if needed
+            target_action_data = self.actions[history_idx, current_idx]
+            if len(target_action_data.shape) == 1 and target_action_data.shape[0] > 1:
+                # One-hot encoded, convert to index
+                target_action = torch.tensor(np.argmax(target_action_data), dtype=torch.long)
+            else:
+                # Already an index
+                target_action = torch.tensor(target_action_data, dtype=torch.long)
             
             return {
                 'compression_stages': compression_stages,
                 'uncompressed_context': uncompressed_context,
                 'query_states': query_states,
-                'target_actions': target_actions,
+                'target_actions': target_action,
                 'num_compression_stages': depth
             }
 
@@ -294,56 +312,43 @@ def collate_compressed_batch(batch):
     """
     Custom collate function for ADCompressedDataset.
     
-    Handles variable-length compression stages by batching them appropriately.
-    For samples with different compression depths, we pad with dummy stages.
+    Assumes all samples in batch have the SAME compression depth (enforced by BucketSampler).
+    Only pads sequences within each stage to the max length in that stage.
     """
     batch_size = len(batch)
-    max_stages = max(item['num_compression_stages'] for item in batch)
+    num_stages = batch[0]['num_compression_stages']
     
-    # Separate batches by number of stages for proper processing
-    # All samples will be processed to have the same max_stages
+    # Verify all samples have same compression depth
+    depths = [item['num_compression_stages'] for item in batch]
+    if not all(d == num_stages for d in depths):
+        print(f"ERROR: Mixed compression depths in batch: {depths}")
+        print(f"Expected all to be {num_stages}")
+        raise AssertionError(
+            f"BucketSampler should ensure all samples in batch have same compression depth. "
+            f"Got depths: {depths}"
+        )
+    
     query_states_list = []
     target_actions_list = []
-    
-    # Organize compression stages - ensure all samples have max_stages
     all_compression_stages = []
     all_uncompressed = []
     
     for item in batch:
-        num_stages = item['num_compression_stages']
-        
-        # For this sample, collect its stages (may be 0 to max_stages)
-        sample_stages = []
-        if num_stages > 0:
-            sample_stages = item['compression_stages']
-        
-        # Pad with None if this sample has fewer stages than max
-        while len(sample_stages) < max_stages:
-            sample_stages.append(None)
-        
-        all_compression_stages.append(sample_stages)
+        all_compression_stages.append(item['compression_stages'])
         all_uncompressed.append(item['uncompressed_context'])
         query_states_list.append(item['query_states'])
         target_actions_list.append(item['target_actions'])
     
-    # Now batch each stage separately
+    # Batch each compression stage
     batched_stages = []
-    for stage_idx in range(max_stages):
+    for stage_idx in range(num_stages):
         # Collect all samples' data for this stage
         stage_samples = [all_compression_stages[i][stage_idx] for i in range(batch_size)]
         
-        # Filter out None (samples that don't have this stage)
-        valid_samples = [s for s in stage_samples if s is not None]
+        # Find max length in this stage
+        max_len = max(s['states'].shape[0] for s in stage_samples)
         
-        if len(valid_samples) == 0:
-            # No samples have this stage, skip
-            continue
-        
-        # Find max length in this stage across valid samples
-        max_len = max(s['states'].shape[0] for s in valid_samples)
-        
-        # For samples without this stage, we need to create dummy data
-        # with the same batch size as the full batch
+        # Pad each sample to max_len
         batched_stage = {
             'states': [],
             'actions': [],
@@ -352,39 +357,30 @@ def collate_compressed_batch(batch):
         }
         
         for sample in stage_samples:
-            if sample is None:
-                # This sample doesn't have this compression stage
-                # Add dummy data with max_len (will be ignored by model if needed)
-                batched_stage['states'].append(torch.zeros(max_len, *valid_samples[0]['states'].shape[1:]))
-                batched_stage['actions'].append(torch.zeros(max_len, *valid_samples[0]['actions'].shape[1:]))
-                batched_stage['rewards'].append(torch.zeros(max_len))
-                batched_stage['next_states'].append(torch.zeros(max_len, *valid_samples[0]['next_states'].shape[1:]))
+            seq_len = sample['states'].shape[0]
+            if seq_len < max_len:
+                pad_len = max_len - seq_len
+                batched_stage['states'].append(torch.cat([
+                    sample['states'], 
+                    torch.zeros(pad_len, *sample['states'].shape[1:])
+                ]))
+                batched_stage['actions'].append(torch.cat([
+                    sample['actions'],
+                    torch.zeros(pad_len, *sample['actions'].shape[1:])
+                ]))
+                batched_stage['rewards'].append(torch.cat([
+                    sample['rewards'],
+                    torch.zeros(pad_len)
+                ]))
+                batched_stage['next_states'].append(torch.cat([
+                    sample['next_states'],
+                    torch.zeros(pad_len, *sample['next_states'].shape[1:])
+                ]))
             else:
-                # Pad to max_len if needed
-                seq_len = sample['states'].shape[0]
-                if seq_len < max_len:
-                    pad_len = max_len - seq_len
-                    batched_stage['states'].append(torch.cat([
-                        sample['states'], 
-                        torch.zeros(pad_len, *sample['states'].shape[1:])
-                    ]))
-                    batched_stage['actions'].append(torch.cat([
-                        sample['actions'],
-                        torch.zeros(pad_len, *sample['actions'].shape[1:])
-                    ]))
-                    batched_stage['rewards'].append(torch.cat([
-                        sample['rewards'],
-                        torch.zeros(pad_len)
-                    ]))
-                    batched_stage['next_states'].append(torch.cat([
-                        sample['next_states'],
-                        torch.zeros(pad_len, *sample['next_states'].shape[1:])
-                    ]))
-                else:
-                    batched_stage['states'].append(sample['states'])
-                    batched_stage['actions'].append(sample['actions'])
-                    batched_stage['rewards'].append(sample['rewards'])
-                    batched_stage['next_states'].append(sample['next_states'])
+                batched_stage['states'].append(sample['states'])
+                batched_stage['actions'].append(sample['actions'])
+                batched_stage['rewards'].append(sample['rewards'])
+                batched_stage['next_states'].append(sample['next_states'])
         
         # Stack into batch dimension
         batched_stage = {
@@ -436,5 +432,73 @@ def collate_compressed_batch(batch):
         'uncompressed_context': batched_uncompressed,
         'query_states': torch.stack(query_states_list),
         'target_actions': torch.stack(target_actions_list),
-        'num_compression_stages': max_stages
+        'num_compression_stages': num_stages
     }
+
+
+class BucketSampler(Sampler):
+    """
+    Sampler that groups samples by compression depth into buckets.
+    Each batch contains only samples with the same compression depth.
+    
+    This eliminates the need for dummy padding across different compression depths.
+    """
+    def __init__(self, dataset, batch_size, shuffle=True, drop_last=False):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+        
+        # Group sample indices by compression depth
+        self.buckets = defaultdict(list)
+        for idx, sample in enumerate(dataset.samples):
+            depth = sample['compression_depth']
+            self.buckets[depth].append(idx)
+        
+        # Print bucket statistics for debugging
+        print(f"\nBucketSampler initialized:")
+        print(f"  Total samples: {len(dataset.samples)}")
+        print(f"  Batch size: {batch_size}")
+        for depth in sorted(self.buckets.keys()):
+            num_samples = len(self.buckets[depth])
+            num_batches = (num_samples + batch_size - 1) // batch_size if drop_last else \
+                         (num_samples // batch_size) + (1 if num_samples % batch_size else 0)
+            print(f"  Depth {depth}: {num_samples} samples -> ~{num_batches} batches")
+        
+        # Precompute batches
+        self._create_batches()
+        print(f"  Created {len(self.batches)} total batches\n")
+    
+    def _create_batches(self):
+        self.batches = []
+        
+        for depth, indices in self.buckets.items():
+            # Create a copy to avoid modifying the original
+            depth_indices = indices.copy()
+            
+            if self.shuffle:
+                random.shuffle(depth_indices)
+            
+            # Create batches for this depth
+            for i in range(0, len(depth_indices), self.batch_size):
+                batch_indices = depth_indices[i:i + self.batch_size]
+                if len(batch_indices) == self.batch_size or not self.drop_last:
+                    # Store both indices and expected depth for verification
+                    self.batches.append({
+                        'indices': batch_indices,
+                        'depth': depth
+                    })
+        
+        if self.shuffle:
+            random.shuffle(self.batches)
+    
+    def __iter__(self):
+        # Recreate batches each epoch if shuffling
+        if self.shuffle:
+            self._create_batches()
+        
+        for batch_info in self.batches:
+            yield batch_info['indices']  # Yield list of indices for this batch
+    
+    def __len__(self):
+        return len(self.batches)  # Number of batches, not total samples
