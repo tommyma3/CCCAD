@@ -1,0 +1,22 @@
+include: config/model/ad_compressed_dr.yaml
+
+# Pre-training specific settings
+
+# Pre-training duration
+pretrain_steps: 50000
+pretrain_warmup_steps: 2000
+
+# Pre-training batch size (can be different from main training)
+pretrain_batch_size: 128
+
+# Pre-training learning rate
+pretrain_lr: 0.0003
+
+# Reconstruction decoder depth (simpler than main decoder)
+pretrain_decoder_n_layer: 2
+
+# Number of workers for data loading
+num_workers: 4
+
+# Note: Encoder architecture (n_latent, encoder_n_layer, etc.) 
+# is inherited from ad_compressed_dr.yaml

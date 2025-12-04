@@ -75,6 +75,41 @@ if __name__ == '__main__':
     model_name = config['model']
     model = MODEL[model_name](config)
 
+    # Load pretrained encoder weights if specified
+    pretrained_encoder_path = config.get('pretrained_encoder_path', None)
+    if pretrained_encoder_path and model_name == 'CompressedAD':
+        if path.exists(pretrained_encoder_path):
+            if accelerator.is_main_process:
+                print(f'\nLoading pretrained encoder from {pretrained_encoder_path}')
+            
+            checkpoint = torch.load(pretrained_encoder_path, map_location='cpu')
+            
+            # Load encoder weights
+            model.encoder.load_state_dict(checkpoint['encoder_state_dict'])
+            
+            # Load embedding weights (shared between encoder and decoder)
+            model.embed_context.load_state_dict(checkpoint['embed_context_state_dict'])
+            model.embed_ln.load_state_dict(checkpoint['embed_ln_state_dict'])
+            
+            if accelerator.is_main_process:
+                print(f'Successfully loaded pretrained encoder from step {checkpoint.get("global_step", "unknown")}')
+            
+            # Optionally freeze encoder
+            if config.get('freeze_encoder', False):
+                if accelerator.is_main_process:
+                    print('Freezing encoder and shared embedding weights')
+                # Freeze encoder
+                for param in model.encoder.parameters():
+                    param.requires_grad = False
+                # Freeze shared embeddings (they were trained with encoder during pre-training)
+                for param in model.embed_context.parameters():
+                    param.requires_grad = False
+                for param in model.embed_ln.parameters():
+                    param.requires_grad = False
+        else:
+            if accelerator.is_main_process:
+                print(f'WARNING: Pretrained encoder path specified but not found: {pretrained_encoder_path}')
+
     load_start_time = datetime.now()
     print(f'Data loading started at {load_start_time}')
 
