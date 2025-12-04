@@ -36,6 +36,9 @@ class CompressionEncoder(nn.Module):
         self.pos_embedding = nn.Parameter(torch.zeros(1, max_encoder_len, tf_n_embd))
         nn.init.trunc_normal_(self.pos_embedding, std=0.02)
         
+        # Input layer normalization for stability
+        self.input_ln = nn.LayerNorm(tf_n_embd)
+        
         # Transformer encoder
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=tf_n_embd,
@@ -44,8 +47,12 @@ class CompressionEncoder(nn.Module):
             activation='gelu',
             batch_first=True,
             dropout=config.get('tf_dropout', 0.1),
+            norm_first=True  # Pre-norm for better gradient flow
         )
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=encoder_n_layer)
+        
+        # Output layer normalization
+        self.output_ln = nn.LayerNorm(tf_n_embd)
         
     def forward(self, context_embeddings):
         """
@@ -58,6 +65,9 @@ class CompressionEncoder(nn.Module):
                 Compressed representation of the context
         """
         batch_size = context_embeddings.size(0)
+        
+        # Apply input normalization
+        context_embeddings = self.input_ln(context_embeddings)
         
         # Expand query tokens for batch
         query_tokens = repeat(self.query_tokens, '1 n d -> b n d', b=batch_size)
@@ -75,6 +85,9 @@ class CompressionEncoder(nn.Module):
         # Extract only the query token positions (last n_latent tokens)
         # These contain the compressed information
         latent_tokens = encoder_output[:, -self.n_latent:, :]  # [B, n_latent, D]
+        
+        # Apply output normalization
+        latent_tokens = self.output_ln(latent_tokens)
         
         return latent_tokens
 
@@ -110,14 +123,25 @@ class CompressedAD(nn.Module):
         self.embed_context = nn.Linear(config['dim_states'] * 2 + config['num_actions'] + 1, tf_n_embd)
         self.embed_query_state = nn.Embedding(config['grid_size'] * config['grid_size'], tf_n_embd)
         
+        # Embedding normalization for stability
+        self.embed_ln = nn.LayerNorm(tf_n_embd)
+        
+        # Initialize embeddings
+        nn.init.xavier_uniform_(self.embed_context.weight)
+        nn.init.zeros_(self.embed_context.bias)
+        nn.init.normal_(self.embed_query_state.weight, mean=0.0, std=0.02)
+        
         # Decoder positional embedding
         self.pos_embedding = nn.Parameter(torch.zeros(1, self.max_seq_length, tf_n_embd))
         nn.init.trunc_normal_(self.pos_embedding, std=0.02)
         
+        # Input layer normalization
+        self.input_ln = nn.LayerNorm(tf_n_embd)
+        
         # Register causal mask buffer
         self.register_buffer('causal_mask', None, persistent=False)
         
-        # Decoder transformer
+        # Decoder transformer with pre-normalization
         decoder_layer = nn.TransformerEncoderLayer(
             d_model=tf_n_embd,
             nhead=tf_n_head,
@@ -125,6 +149,7 @@ class CompressedAD(nn.Module):
             activation='gelu',
             batch_first=True,
             dropout=config.get('tf_dropout', 0.1),
+            norm_first=True  # Pre-norm for better gradient flow
         )
         self.transformer_decoder = nn.TransformerEncoder(decoder_layer, num_layers=tf_n_layer)
         
@@ -139,10 +164,42 @@ class CompressedAD(nn.Module):
         x = x + self.pos_embedding[:, :seq_len, :]
         return x
     
-    def _get_causal_mask(self, seq_len):
-        """Generate causal attention mask for autoregressive prediction."""
+    def _get_causal_mask(self, seq_len, n_prefix_tokens=0):
+        """
+        Generate causal attention mask for autoregressive prediction.
+        
+        Args:
+            seq_len: Total sequence length
+            n_prefix_tokens: Number of prefix tokens (latents) that can attend to each other bidirectionally
+        
+        Returns:
+            mask: Attention mask where:
+                - Prefix tokens can attend to all prefix tokens (no masking)
+                - Context tokens use causal masking (can only attend to past)
+        """
         if self.causal_mask is None or self.causal_mask.size(0) != seq_len:
-            mask = torch.triu(torch.full((seq_len, seq_len), float('-inf')), diagonal=1)
+            if n_prefix_tokens > 0:
+                # Create hybrid mask: bidirectional for prefix, causal for rest
+                mask = torch.zeros(seq_len, seq_len)
+                
+                # Prefix tokens (latents) can attend to all prefix tokens
+                # No masking needed for prefix region
+                
+                # Context tokens use causal masking
+                if seq_len > n_prefix_tokens:
+                    # Create causal mask for context region
+                    context_len = seq_len - n_prefix_tokens
+                    causal_part = torch.triu(torch.full((context_len, context_len), float('-inf')), diagonal=1)
+                    
+                    # Apply causal mask to context-to-context attention
+                    mask[n_prefix_tokens:, n_prefix_tokens:] = causal_part
+                    
+                    # Context can attend to all prefix tokens (no masking)
+                    # This is already 0 in the mask
+            else:
+                # Pure causal mask
+                mask = torch.triu(torch.full((seq_len, seq_len), float('-inf')), diagonal=1)
+            
             self.causal_mask = mask.to(self.device)
         return self.causal_mask
     
@@ -169,6 +226,9 @@ class CompressedAD(nn.Module):
         # Concatenate context
         context, _ = pack([states, actions, rewards, next_states], 'b l *')
         context_embed = self.embed_context(context)
+        
+        # Apply layer normalization for stability
+        context_embed = self.embed_ln(context_embed)
         
         return context_embed
     
@@ -219,14 +279,21 @@ class CompressedAD(nn.Module):
         
         # Build decoder input: [latents (if exist)] + [uncompressed] + [query]
         if latent_tokens is not None:
+            n_latent_tokens = latent_tokens.size(1)
             decoder_input, _ = pack([latent_tokens, uncompressed_embed, query_states_embed], 'b * d')
         else:
+            n_latent_tokens = 0
             decoder_input, _ = pack([uncompressed_embed, query_states_embed], 'b * d')
         
-        # Apply positional embedding and causal masking
+        # Apply input normalization
+        decoder_input = self.input_ln(decoder_input)
+        
+        # Apply positional embedding
         decoder_input = self._apply_positional_embedding(decoder_input)
+        
+        # Get attention mask with proper handling of latent tokens
         seq_len = decoder_input.size(1)
-        attn_mask = self._get_causal_mask(seq_len)
+        attn_mask = self._get_causal_mask(seq_len, n_prefix_tokens=n_latent_tokens)
         
         # Decoder forward
         transformer_output = self.transformer_decoder(decoder_input, mask=attn_mask)
@@ -272,10 +339,13 @@ class CompressedAD(nn.Module):
             
             # Build decoder input
             if latent_tokens is not None and context_embed is not None:
+                n_latent_tokens = latent_tokens.size(1)
                 decoder_input, _ = pack([latent_tokens, context_embed, query_states_embed], 'e * d')
             elif context_embed is not None:
+                n_latent_tokens = 0
                 decoder_input, _ = pack([context_embed, query_states_embed], 'e * d')
             else:
+                n_latent_tokens = 0
                 decoder_input = query_states_embed
             
             # Check if we need to compress
@@ -315,12 +385,16 @@ class CompressedAD(nn.Module):
                 context_embed = context_to_keep
                 
                 # Rebuild decoder input
+                n_latent_tokens = latent_tokens.size(1)
                 decoder_input, _ = pack([latent_tokens, context_embed, query_states_embed], 'e * d')
             
+            # Apply input normalization
+            decoder_input_norm = self.input_ln(decoder_input)
+            
             # Apply positional embedding and decode
-            decoder_input_pos = self._apply_positional_embedding(decoder_input)
+            decoder_input_pos = self._apply_positional_embedding(decoder_input_norm)
             seq_len = decoder_input_pos.size(1)
-            attn_mask = self._get_causal_mask(seq_len)
+            attn_mask = self._get_causal_mask(seq_len, n_prefix_tokens=n_latent_tokens)
             output = self.transformer_decoder(decoder_input_pos, mask=attn_mask)
             
             # Predict action

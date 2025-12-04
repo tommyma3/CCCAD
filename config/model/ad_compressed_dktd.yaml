@@ -1,22 +1,41 @@
 include: config/model/ad_base.yaml
 
-model: AD
+model: CompressedAD
 
-# Transformer
-tf_n_embd: 64
+# Transformer Decoder
+tf_n_embd: 128
 tf_n_layer: 4
-tf_n_head: 4
+tf_n_head: 8
 tf_dropout: 0.1
 tf_attn_dropout: 0.1
-tf_n_inner: 128
+tf_dim_feedforward: 512
+decoder_max_seq_length: 200  # Match n_transit
+
+# Compression Encoder
+encoder_n_layer: 3
+encoder_n_head: 8
+encoder_dim_feedforward: 512
+max_encoder_length: 512
+n_latent: 35  # Smaller for shorter sequences in DKTD
+
+# Compression parameters for dataset
+max_compression_depth: 3
+min_compress_length: 15
+max_compress_length: 50
+min_uncompressed_length: 10
+max_uncompressed_length: 80
+
+# Context window
 n_transit: 200
 
-# training
-lr: 0.01
-train_batch_size: 4096
-test_batch_size: 8192
+# Training
+lr: 0.0001
+train_batch_size: 128
+test_batch_size: 256
 train_source_timesteps: 1000
-train_timesteps: 50000
-num_warmup_steps: 1000
+train_timesteps: 150000
+num_warmup_steps: 5000
+weight_decay: 0.01
+grad_clip_norm: 1.0
 
 num_workers: 2

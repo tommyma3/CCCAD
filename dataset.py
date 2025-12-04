@@ -144,27 +144,41 @@ class ADCompressedDataset(Dataset):
     
     def _generate_sample_indices(self):
         """
-        Pre-generate all valid sample configurations.
+        Pre-generate all valid sample configurations with better coverage.
         
         Each sample specifies:
         - history_idx: which trajectory (maintains cross-episode history)
         - compression_depth: 0-3 compression cycles
         - segment_lengths: list of segment lengths for each compression stage
         - target_idx: which timestep to predict
+        
+        Strategy: Generate more samples with higher compression depths to match
+        the distribution seen during long evaluation episodes.
         """
         samples = []
         
         n_histories = len(self.states)
         traj_length = self.states.shape[1]
         
+        # Weight distribution towards higher compression depths
+        # This ensures model learns to handle compressed contexts
+        depth_weights = {0: 1, 1: 2, 2: 3, 3: 4}  # More samples for higher depths
+        
         for history_idx in range(n_histories):
             # Generate samples with different compression depths
             for depth in range(self.max_compression_depth + 1):
+                n_samples_for_depth = depth_weights.get(depth, 1)
+                
                 if depth == 0:
-                    # No compression: simple case
+                    # No compression: sample from various context lengths
                     min_len = self.min_uncompressed_length + 1
-                    for context_len in range(min_len, min(self.max_uncompressed_length + 1, traj_length)):
-                        for target_idx in range(context_len, min(context_len + 20, traj_length)):
+                    max_len = min(self.max_uncompressed_length + 1, traj_length)
+                    
+                    # Sample multiple context lengths
+                    for _ in range(n_samples_for_depth * 3):
+                        context_len = random.randint(min_len, max_len)
+                        if context_len < traj_length:
+                            target_idx = random.randint(context_len, min(context_len + 30, traj_length - 1))
                             samples.append({
                                 'history_idx': history_idx,
                                 'compression_depth': 0,
@@ -173,28 +187,25 @@ class ADCompressedDataset(Dataset):
                                 'target_idx': target_idx
                             })
                 else:
-                    # Multiple compression stages
-                    # Generate random valid segmentations
-                    for _ in range(5):  # 5 random samples per depth per history
+                    # Multiple compression stages - generate varied configurations
+                    for _ in range(n_samples_for_depth * 10):  # More samples for compression training
                         segment_lengths = []
                         total_length = 0
                         
                         # Generate compression stage lengths
                         for stage in range(depth):
-                            if stage == 0:
-                                seg_len = random.randint(self.min_compress_length, self.max_compress_length)
-                            else:
-                                seg_len = random.randint(self.min_compress_length, 
-                                                        min(self.max_compress_length, 40))
+                            # Vary segment lengths more to expose model to diverse compressions
+                            seg_len = random.randint(self.min_compress_length, self.max_compress_length)
                             segment_lengths.append(seg_len)
                             total_length += seg_len
                         
-                        # Add uncompressed segment
-                        uncomp_len = random.randint(self.min_uncompressed_length, self.max_uncompressed_length)
+                        # Add uncompressed segment with varied length
+                        uncomp_len = random.randint(self.min_uncompressed_length, 
+                                                   min(self.max_uncompressed_length, 80))
                         total_length += uncomp_len
                         
                         # Check if valid
-                        if total_length < traj_length:
+                        if total_length < traj_length - 5:  # Leave room for target
                             samples.append({
                                 'history_idx': history_idx,
                                 'compression_depth': depth,
@@ -202,6 +213,14 @@ class ADCompressedDataset(Dataset):
                                 'uncompressed_length': uncomp_len,
                                 'total_length': total_length
                             })
+        
+        random.shuffle(samples)
+        print(f"\nGenerated {len(samples)} training samples")
+        depth_counts = {}
+        for s in samples:
+            d = s['compression_depth']
+            depth_counts[d] = depth_counts.get(d, 0) + 1
+        print(f"Samples per depth: {depth_counts}")
         
         return samples
     

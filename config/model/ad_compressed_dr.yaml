@@ -3,37 +3,40 @@ include: config/model/ad_base.yaml
 model: CompressedAD
 
 # Transformer Decoder
-tf_n_embd: 64
+tf_n_embd: 128  # Increased for better capacity
 tf_n_layer: 4
-tf_n_head: 4
+tf_n_head: 8  # More heads for better attention
 tf_dropout: 0.1
 tf_attn_dropout: 0.1
-tf_dim_feedforward: 256
+tf_dim_feedforward: 512  # Increased feedforward dimension
 decoder_max_seq_length: 240  # Max sequence length for decoder (includes latents + context + query)
 
 # Compression Encoder
 encoder_n_layer: 3  # Encoder can be smaller/same/larger than decoder
-encoder_n_head: 4
-encoder_dim_feedforward: 256
+encoder_n_head: 8  # Match decoder heads
+encoder_dim_feedforward: 512  # Match decoder feedforward
 max_encoder_length: 512  # Max input length to encoder (latents + context)
-n_latent: 60  # Number of latent tokens output by encoder
+n_latent: 40  # Reduced number of latent tokens (was 60) for better information density
 
 # Compression parameters for dataset
 max_compression_depth: 3  # Maximum compression cycles (0-3)
-min_compress_length: 10  # Min timesteps to compress in each stage
-max_compress_length: 50  # Max timesteps to compress in each stage
-min_uncompressed_length: 5  # Min recent context to keep uncompressed
-max_uncompressed_length: 160  # Max recent context (decoder_max - n_latent - 1 for safety)
+min_compress_length: 15  # Min timesteps to compress in each stage (increased from 10)
+max_compress_length: 60  # Max timesteps to compress in each stage (increased from 50)
+min_uncompressed_length: 10  # Min recent context to keep uncompressed (increased from 5)
+max_uncompressed_length: 100  # Max recent context (reduced to decoder_max - n_latent - margin)
 
 # Context window (for AD compatibility)
 n_transit: 240  
 
-# Training
-lr: 0.0003  
-train_batch_size: 256  # Smaller batch for compressed model (more complex)
-test_batch_size: 512
+# Training - CRITICAL FIXES
+lr: 0.0001  # Reduced from 0.0003 - too high for complex model
+train_batch_size: 128  # Increased from 256 for more stable gradients
+test_batch_size: 256  # Reduced from 512
 train_source_timesteps: 1000
-train_timesteps: 100000  # More steps for compression learning
-num_warmup_steps: 2000  
+train_timesteps: 150000  # Increased from 100000 - compression needs more training
+num_warmup_steps: 5000  # Increased from 2000 for gradual warmup
+weight_decay: 0.01  # Standard weight decay
+grad_clip_norm: 1.0  # Gradient clipping for stability
 
 num_workers: 4
+
