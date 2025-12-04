@@ -156,8 +156,15 @@ class CompressedAD(nn.Module):
         # Action prediction head
         self.pred_action = nn.Linear(tf_n_embd, config['num_actions'])
         
+        # Reconstruction head for auxiliary loss (helps encoder learn)
+        self.use_reconstruction_loss = config.get('use_reconstruction_loss', True)
+        if self.use_reconstruction_loss:
+            self.reconstruct_head = nn.Linear(tf_n_embd, config['dim_states'] * 2 + config['num_actions'] + 1)
+        
         # Loss function
         self.loss_fn = nn.CrossEntropyLoss(reduction='mean', label_smoothing=config['label_smoothing'])
+        if self.use_reconstruction_loss:
+            self.reconstruct_loss_fn = nn.MSELoss(reduction='mean')
     
     def _apply_positional_embedding(self, x):
         seq_len = x.size(1)
@@ -305,10 +312,41 @@ class CompressedAD(nn.Module):
         loss_action = self.loss_fn(logits_actions, target_actions)
         acc_action = (logits_actions.argmax(dim=-1) == target_actions).float().mean()
         
-        result = {
-            'loss_action': loss_action,
-            'acc_action': acc_action
-        }
+        # Auxiliary reconstruction loss to help encoder learn
+        loss_total = loss_action
+        if self.use_reconstruction_loss and num_stages > 0 and latent_tokens is not None:
+            # Reconstruct the last compressed stage from latents
+            last_stage = compression_stages[-1]
+            last_stage_embed = self._embed_context_dict(last_stage)  # [B, L, D]
+            
+            # Use latent tokens to reconstruct
+            reconstructed = self.reconstruct_head(latent_tokens)  # [B, n_latent, context_dim]
+            
+            # Target: average of last stage context (simple but effective)
+            target_context, _ = pack([last_stage['states'], last_stage['actions'], 
+                                     last_stage['rewards'].unsqueeze(-1) if last_stage['rewards'].dim() == 2 else last_stage['rewards'],
+                                     last_stage['next_states']], 'b l *')
+            target_context = target_context.to(self.device)
+            
+            # Average pool to match latent size
+            target_pooled = F.adaptive_avg_pool1d(
+                target_context.transpose(1, 2), 
+                self.n_latent
+            ).transpose(1, 2)  # [B, n_latent, context_dim]
+            
+            loss_reconstruct = self.reconstruct_loss_fn(reconstructed, target_pooled)
+            loss_total = loss_action + 0.1 * loss_reconstruct  # Weight reconstruction loss lower
+            
+            result = {
+                'loss_action': loss_total,
+                'acc_action': acc_action,
+                'loss_reconstruct': loss_reconstruct.detach()
+            }
+        else:
+            result = {
+                'loss_action': loss_action,
+                'acc_action': acc_action
+            }
         
         return result
     

@@ -194,6 +194,8 @@ if __name__ == '__main__':
                 writer.add_scalar('train/loss_action', output['loss_action'], step)
                 writer.add_scalar('train/lr', lr_sched.get_last_lr()[0], step)
                 writer.add_scalar('train/acc_action', output['acc_action'].item(), step)
+                if 'loss_reconstruct' in output:
+                    writer.add_scalar('train/loss_reconstruct', output['loss_reconstruct'].item(), step)
 
 
             # Eval - synchronize all processes before evaluation

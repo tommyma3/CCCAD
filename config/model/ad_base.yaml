@@ -2,7 +2,7 @@ dynamics: False
 dynamics_strength: 1.0
 
 # training
-label_smoothing: 0.0
+label_smoothing: 0.1  # Add label smoothing to prevent overconfidence
 flash_attn: True
 ## optimizer
 beta1: 0.9
