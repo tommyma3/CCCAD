@@ -46,8 +46,19 @@ class ReconstructionDecoder(nn.Module):
         n_head = config.get('tf_n_head', 4)
         dim_feedforward = config.get('tf_dim_feedforward', tf_n_embd * 4)
         
-        # Decoder transformer
-        decoder_layer = nn.TransformerEncoderLayer(
+        # Positional embedding for decoder output - needs to handle multi-stage compression
+        # Max length = max_compress_length * max_compression_depth (e.g., 40 * 3 = 120)
+        max_seq_len = config.get('max_compress_length', 50) * config.get('max_compression_depth', 3) + 50
+        self.pos_embedding = nn.Parameter(torch.zeros(1, max_seq_len, tf_n_embd))
+        nn.init.trunc_normal_(self.pos_embedding, std=0.02)
+        self.max_seq_len = max_seq_len
+        
+        # Learnable upsampling queries to expand latents back to sequence
+        # This forces the encoder to compress information into latents
+        self.expand_factor = config.get('pretrain_expand_factor', 2)  # expand latents 2x
+        
+        # Decoder transformer with cross-attention to latents
+        decoder_layer = nn.TransformerDecoderLayer(
             d_model=tf_n_embd,
             nhead=n_head,
             dim_feedforward=dim_feedforward,
@@ -56,20 +67,38 @@ class ReconstructionDecoder(nn.Module):
             dropout=config.get('tf_dropout', 0.1),
             norm_first=True
         )
-        self.transformer = nn.TransformerEncoder(decoder_layer, num_layers=n_layer)
+        self.transformer = nn.TransformerDecoder(decoder_layer, num_layers=n_layer)
+        
+        # Information bottleneck: dropout on latents before decoding
+        self.latent_dropout = nn.Dropout(p=0.3)  # Force encoder to be robust
         
         # Output projection back to embedding space
         self.output_proj = nn.Linear(tf_n_embd, tf_n_embd)
         
-    def forward(self, latent_tokens):
+    def forward(self, latent_tokens, target_seq_len):
         """
         Args:
-            latent_tokens: [batch, n_latent, tf_n_embd]
+            latent_tokens: [batch, n_latent, tf_n_embd] - compressed representation
+            target_seq_len: int - length of sequence to reconstruct
         Returns:
-            reconstructed: [batch, n_latent, tf_n_embd]
+            reconstructed: [batch, target_seq_len, tf_n_embd] - reconstructed sequence
         """
-        # Process through decoder
-        decoded = self.transformer(latent_tokens)
+        batch_size = latent_tokens.size(0)
+        
+        # Ensure target_seq_len doesn't exceed max
+        if target_seq_len > self.max_seq_len:
+            raise ValueError(f"target_seq_len {target_seq_len} exceeds max_seq_len {self.max_seq_len}")
+        
+        # Create learnable queries for reconstruction (one per output timestep)
+        # These act as "slots" asking the latents to fill in information
+        queries = self.pos_embedding[:, :target_seq_len, :].expand(batch_size, -1, -1)
+        
+        # Apply dropout to latents to create information bottleneck
+        # Forces encoder to learn robust, meaningful representations
+        latent_tokens_dropped = self.latent_dropout(latent_tokens)
+        
+        # Decode: queries attend to latent tokens via cross-attention
+        decoded = self.transformer(queries, latent_tokens_dropped)
         
         # Project to output
         reconstructed = self.output_proj(decoded)
@@ -141,8 +170,9 @@ class EncoderPretrainModel(nn.Module):
         num_stages = batch['num_stages']
         encoder_input_stages = batch['encoder_input_stages']
         
-        # Hierarchical compression
+        # Hierarchical compression - store all input embeddings for reconstruction target
         latent_tokens = None
+        all_input_embeds = []
         
         for stage_idx in range(num_stages):
             stage = encoder_input_stages[stage_idx]
@@ -154,6 +184,7 @@ class EncoderPretrainModel(nn.Module):
             next_states = stage['next_states'].to(self.device)
             
             context_embed = self._embed_context_sequence(states, actions, rewards, next_states)
+            all_input_embeds.append(context_embed)
             
             # Combine with previous latents
             if latent_tokens is not None:
@@ -164,23 +195,38 @@ class EncoderPretrainModel(nn.Module):
             # Compress
             latent_tokens = self.encoder(encoder_input)
         
+        # Concatenate all input embeddings as reconstruction target
+        # This is what the encoder should learn to compress
+        target_sequence = torch.cat(all_input_embeds, dim=1)  # [B, total_len, D]
+        target_len = target_sequence.size(1)
+        
+        # Make task harder: only reconstruct a random subset (50-100%) of the sequence
+        # This prevents memorization and forces semantic compression
+        if self.training:
+            subset_ratio = torch.rand(1).item() * 0.5 + 0.5  # 0.5 to 1.0
+            subset_len = max(1, int(target_len * subset_ratio))
+            # Random starting position
+            start_idx = torch.randint(0, target_len - subset_len + 1, (1,)).item() if target_len > subset_len else 0
+            target_subset = target_sequence[:, start_idx:start_idx+subset_len, :]
+        else:
+            subset_len = target_len
+            target_subset = target_sequence
+        
         # Reconstruct from latent tokens
-        reconstructed = self.decoder(latent_tokens)
+        reconstructed = self.decoder(latent_tokens, subset_len)
         
-        # Target: the latent tokens themselves (autoencoding in latent space)
-        # We train the encoder to produce latents that contain enough information
-        # for the decoder to reconstruct a good representation
-        target = latent_tokens.detach()
+        # Compute reconstruction loss - force encoder to preserve information
+        loss = self.loss_fn(reconstructed, target_subset)
         
-        # Compute reconstruction loss
-        loss = self.loss_fn(reconstructed, target)
-        
-        # Also compute a simple information retention metric
-        # (correlation between reconstructed and target)
+        # Information retention metric (correlation between reconstructed and target subset)
         with torch.no_grad():
             reconstructed_flat = reconstructed.reshape(-1)
-            target_flat = target.reshape(-1)
-            correlation = torch.corrcoef(torch.stack([reconstructed_flat, target_flat]))[0, 1]
+            target_flat = target_subset.reshape(-1)  # Use target_subset, not target_sequence
+            # Handle edge case where all values are same
+            if reconstructed_flat.std() > 1e-6 and target_flat.std() > 1e-6:
+                correlation = torch.corrcoef(torch.stack([reconstructed_flat, target_flat]))[0, 1]
+            else:
+                correlation = torch.tensor(0.0)
         
         return {
             'loss': loss,
@@ -358,16 +404,16 @@ def pretrain_encoder(config):
 if __name__ == '__main__':
     multiprocessing.set_start_method('spawn', force=True)
     
-    # Load config
+    # Load config - use pretrain_encoder.yaml which includes ad_compressed_dr.yaml
     config = get_config('./config/env/darkroom.yaml')
     config.update(get_config('./config/algorithm/ppo_darkroom.yaml'))
-    config.update(get_config('./config/model/ad_compressed_dr.yaml'))
+    config.update(get_config('./config/model/pretrain_encoder.yaml'))
     
     # Pre-training specific settings
     config['traj_dir'] = './datasets'
     config['mixed_precision'] = 'fp16'
     
-    # Pre-training hyperparameters (can override in config file)
+    # Defaults for any missing pre-training hyperparameters
     config.setdefault('pretrain_steps', 50000)
     config.setdefault('pretrain_batch_size', 128)
     config.setdefault('pretrain_lr', 0.0003)

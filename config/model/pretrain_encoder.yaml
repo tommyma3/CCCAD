@@ -15,6 +15,10 @@ pretrain_lr: 0.0003
 # Reconstruction decoder depth (simpler than main decoder)
 pretrain_decoder_n_layer: 2
 
+# Reconstruction expansion factor (how much to expand latents for reconstruction)
+# Higher = harder task, forces better compression
+pretrain_expand_factor: 2
+
 # Number of workers for data loading
 num_workers: 4
 

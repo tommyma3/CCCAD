@@ -20,6 +20,10 @@ n_latent: 20  # Fewer latent tokens for stronger compression signal
 
 use_reconstruction_loss: true
 
+# Pre-trained encoder settings (optional - uncomment to use pretrained encoder)
+pretrained_encoder_path: './runs/pretrain-encoder-darkroom-seed0/encoder-pretrained-final.pt'
+freeze_encoder: false  # true = frozen encoder, false = fine-tune encoder (recommended)
+
 # Compression parameters for dataset - SIMPLIFIED
 max_compression_depth: 2  # Reduce to 2 cycles max (0, 1, 2)
 min_compress_length: 20  # Longer segments
