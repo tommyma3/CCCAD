@@ -1,3 +1,16 @@
+"""
+Training script for Algorithm Distillation (AD).
+
+This script trains the original AD model with decoder-only transformer.
+Supports multi-GPU training via Hugging Face Accelerate.
+
+Usage:
+    accelerate launch train.py
+    
+For multi-GPU:
+    accelerate launch --multi_gpu --num_processes=N train.py
+"""
+
 from datetime import datetime
 import os
 import os.path as path
@@ -6,6 +19,7 @@ from glob import glob
 import shutil
 
 from accelerate import Accelerator
+from accelerate.utils import set_seed
 
 import yaml
 import torch
@@ -31,36 +45,51 @@ if __name__ == '__main__':
     config.update(get_config('./config/algorithm/ppo_darkroom.yaml'))
     config.update(get_config('./config/model/ad_dr.yaml'))
 
+    # Set seed for reproducibility
+    set_seed(config.get('seed', 42))
+
     log_dir = path.join('./runs', f"{config['model']}-{config['env']}-seed{config['env_split_seed']}")
     
-    writer = SummaryWriter(log_dir, flush_secs=15)
-
     config['log_dir'] = log_dir
     config_save_path = path.join(config['log_dir'], 'config.yaml')
-    try:
-        # Try to open config file to bypass NFS cache
-        with open(config_save_path, 'r') as f:
-            f.read(1)
-            config_exists = True
-    except FileNotFoundError:
-        config_exists = False
-
-    if config_exists:
-        print(f'WARNING: {log_dir} already exists. Skipping...')
-        exit(0)        
-
+    
     config['traj_dir'] = './datasets'
     config['mixed_precision'] = 'fp32'
 
-    accelerator = Accelerator(mixed_precision='no')
+    # Initialize accelerator for multi-GPU support
+    accelerator = Accelerator(
+        mixed_precision=config['mixed_precision'],
+        gradient_accumulation_steps=config.get('gradient_accumulation_steps', 1),
+    )
     config['device'] = accelerator.device
-    print('Using Device: ', config['device'])
+    
+    # Only main process handles logging and checkpointing
+    is_main = accelerator.is_main_process
+    
+    if is_main:
+        try:
+            # Try to open config file to bypass NFS cache
+            with open(config_save_path, 'r') as f:
+                f.read(1)
+                config_exists = True
+        except FileNotFoundError:
+            config_exists = False
+
+        if config_exists:
+            print(f'WARNING: {log_dir} already exists. Skipping...')
+            exit(0)
+        
+        os.makedirs(log_dir, exist_ok=True)
+        writer = SummaryWriter(log_dir, flush_secs=15)
+        print(f'Using Device: {config["device"]}')
+        print(f'Number of processes: {accelerator.num_processes}')
 
     model_name = config['model']
     model = MODEL[model_name](config)
 
-    load_start_time = datetime.now()
-    print(f'Data loading started at {load_start_time}')
+    if is_main:
+        load_start_time = datetime.now()
+        print(f'Data loading started at {load_start_time}')
 
     train_dataset = ADDataset(config, config['traj_dir'], 'train', config['train_n_stream'], config['train_source_timesteps'])
     test_dataset = ADDataset(config, config['traj_dir'], 'test', 1, config['train_source_timesteps'])
@@ -70,10 +99,11 @@ if __name__ == '__main__':
 
     test_dataloader = get_data_loader(test_dataset, batch_size=config['test_batch_size'], config=config, shuffle=False)
     
-    load_end_time = datetime.now()
-    print()
-    print(f'Data loading ended at {load_end_time}')
-    print(f'Elapsed time: {load_end_time - load_start_time}')
+    if is_main:
+        load_end_time = datetime.now()
+        print()
+        print(f'Data loading ended at {load_end_time}')
+        print(f'Elapsed time: {load_end_time - load_start_time}')
 
     optimizer = AdamW(model.parameters(), lr = config['lr'], betas=(config['beta1'], config['beta2']), weight_decay=config['weight_decay'])
     lr_sched = get_cosine_schedule_with_warmup(optimizer, config['num_warmup_steps'], config['train_timesteps'])
@@ -82,12 +112,13 @@ if __name__ == '__main__':
     ckpt_paths = sorted(glob(path.join(config['log_dir'], 'ckpt-*.pt')))
     if len(ckpt_paths) > 0:
         ckpt_path = ckpt_paths[-1]
-        ckpt = torch.load(ckpt_path)
+        ckpt = torch.load(ckpt_path, map_location=config['device'])
         model.load_state_dict(ckpt['model'])
         optimizer.load_state_dict(ckpt['optimizer'])
         lr_sched.load_state_dict(ckpt['lr_sched'])
         step = ckpt['step']
-        print(f'Checkpoint loaded from {ckpt_path}')
+        if is_main:
+            print(f'Checkpoint loaded from {ckpt_path}')
 
     env_name = config['env']
     train_env_args, test_env_args = SAMPLE_ENVIRONMENT[env_name](config)
@@ -102,10 +133,11 @@ if __name__ == '__main__':
     
     model, optimizer, train_dataloader, lr_sched = accelerator.prepare(model, optimizer, train_dataloader, lr_sched)
 
-    start_time = datetime.now()
-    print(f'Trainig started at {start_time}')
+    if is_main:
+        start_time = datetime.now()
+        print(f'Training started at {start_time}')
 
-    with tqdm(total=config['train_timesteps'], position=0, leave=True, disable=False) as pbar:
+    with tqdm(total=config['train_timesteps'], position=0, leave=True, disable=not is_main) as pbar:
         pbar.update(step)
 
         while True:
@@ -128,7 +160,7 @@ if __name__ == '__main__':
 
             pbar.set_postfix(loss=loss.item())
 
-            if step % config['summary_interval'] == 0:
+            if is_main and step % config['summary_interval'] == 0:
                 writer.add_scalar('train/loss', loss.item(), step)
                 writer.add_scalar('train/loss_action', output['loss_action'], step)
                 writer.add_scalar('train/lr', lr_sched.get_last_lr()[0], step)
@@ -136,7 +168,7 @@ if __name__ == '__main__':
 
 
             # Eval
-            if step % config['eval_interval'] == 0:
+            if is_main and step % config['eval_interval'] == 0:
                 torch.cuda.empty_cache()
                 model.eval()
                 eval_start_time = datetime.now()
@@ -178,7 +210,7 @@ if __name__ == '__main__':
             pbar.update(1)
 
             # LOGGING
-            if step % config['ckpt_interval'] == 0:
+            if is_main and step % config['ckpt_interval'] == 0:
                 # Remove old checkpoints
                 ckpt_paths = sorted(glob(path.join(config['log_dir'], 'ckpt-*.pt')))
                 for ckpt_path in ckpt_paths:
@@ -186,10 +218,13 @@ if __name__ == '__main__':
 
                 new_ckpt_path = path.join(config['log_dir'], f'ckpt-{step}.pt')
 
+                # Get unwrapped model state dict for saving
+                unwrapped_model = accelerator.unwrap_model(model)
+
                 torch.save({
                     'step': step,
                     'config': config,
-                    'model': model.state_dict(),
+                    'model': unwrapped_model.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'lr_sched': lr_sched.state_dict(),
                 }, new_ckpt_path)
@@ -198,10 +233,13 @@ if __name__ == '__main__':
             if step >= config['train_timesteps']:
                 break
 
-    writer.flush()
+    if is_main:
+        writer.flush()
+    
     envs.close()
 
-    end_time = datetime.now()
-    print()
-    print(f'Training ended at {end_time}')
-    print(f'Elapsed time: {end_time - start_time}')
+    if is_main:
+        end_time = datetime.now()
+        print()
+        print(f'Training ended at {end_time}')
+        print(f'Elapsed time: {end_time - start_time}')
