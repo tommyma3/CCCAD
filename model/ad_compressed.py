@@ -177,7 +177,12 @@ class CompressedAD(nn.Module):
                 - Prefix tokens can attend to all prefix tokens (no masking)
                 - Context tokens use causal masking (can only attend to past)
         """
-        if self.causal_mask is None or self.causal_mask.size(0) != seq_len:
+        # Cache key should include both seq_len AND n_prefix_tokens
+        cache_key = (seq_len, n_prefix_tokens)
+        if not hasattr(self, '_mask_cache'):
+            self._mask_cache = {}
+        
+        if cache_key not in self._mask_cache:
             if n_prefix_tokens > 0:
                 # Create hybrid mask: bidirectional for prefix, causal for rest
                 mask = torch.zeros(seq_len, seq_len)
@@ -200,8 +205,9 @@ class CompressedAD(nn.Module):
                 # Pure causal mask
                 mask = torch.triu(torch.full((seq_len, seq_len), float('-inf')), diagonal=1)
             
-            self.causal_mask = mask.to(self.device)
-        return self.causal_mask
+            self._mask_cache[cache_key] = mask.to(self.device)
+        
+        return self._mask_cache[cache_key]
     
     def _embed_context_dict(self, context_dict):
         """
@@ -289,7 +295,8 @@ class CompressedAD(nn.Module):
         decoder_input = self.input_ln(decoder_input)
         
         # Apply positional embedding
-        decoder_input = self._apply_positional_embedding(decoder_input)
+        seq_len = min(decoder_input.size(1), self.pos_embedding.size(1))
+        decoder_input = decoder_input + self.pos_embedding[:, :seq_len, :]
         
         # Get attention mask with proper handling of latent tokens
         seq_len = decoder_input.size(1)
@@ -437,6 +444,7 @@ class CompressedAD(nn.Module):
             # Create new context transition and append
             new_transition, _ = pack([query_states_prev, actions_onehot, rewards_tensor, states_next], 'e i *')
             new_transition_embed = self.embed_context(new_transition)
+            new_transition_embed = self.embed_ln(new_transition_embed)  # Add this
             
             if context_embed is not None:
                 context_embed = torch.cat([context_embed, new_transition_embed], dim=1)
