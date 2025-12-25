@@ -21,7 +21,7 @@ torch.backends.cudnn.deterministic = True
 
 
 if __name__ == '__main__':
-    ckpt_dir = './runs/CompressedAD-darkroom-seed0'
+    ckpt_dir = './runs/AD-darkroom-seed0'
     ckpt_paths = sorted(glob(path.join(ckpt_dir, 'ckpt-*.pt')))
 
     if len(ckpt_paths) > 0:
@@ -53,9 +53,7 @@ if __name__ == '__main__':
 
     start_time = datetime.now()
     print(f'Starting at {start_time}')
-    
-    # For CompressedAD: automatic hierarchical compression during evaluation
-    # When sequence length exceeds max, encoder compresses context into latents
+
     with torch.no_grad():
         test_rewards = model.evaluate_in_context(vec_env=envs, eval_timesteps=config['horizon'] * 500)['reward_episode']
         path = path.join(ckpt_dir, 'eval_result.npy')

@@ -6,14 +6,13 @@ from glob import glob
 import shutil
 
 from accelerate import Accelerator
-from accelerate.utils import DistributedDataParallelKwargs
 
 import yaml
 import torch
 from torch.optim import AdamW
 from torch.utils.tensorboard import SummaryWriter
 
-from dataset import ADDataset, ADCompressedDataset, collate_compressed_batch
+from dataset import ADDataset
 from env import SAMPLE_ENVIRONMENT
 from model import MODEL
 from utils import get_config, get_data_loader, log_in_context, next_dataloader
@@ -30,7 +29,7 @@ if __name__ == '__main__':
     
     config = get_config('./config/env/darkroom.yaml')
     config.update(get_config('./config/algorithm/ppo_darkroom.yaml'))
-    config.update(get_config('./config/model/ad_compressed_dr.yaml'))  # Use CompressedAD config
+    config.update(get_config('./config/model/ad_dr.yaml'))
 
     log_dir = path.join('./runs', f"{config['model']}-{config['env']}-seed{config['env_split_seed']}")
     
@@ -51,117 +50,25 @@ if __name__ == '__main__':
         exit(0)        
 
     config['traj_dir'] = './datasets'
-    config['mixed_precision'] = 'fp16'
+    config['mixed_precision'] = 'fp32'
 
-    # Initialize Accelerator for multi-GPU training
-    # find_unused_parameters=True needed for CompressedAD because encoder isn't used when compression_depth=0
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-    accelerator = Accelerator(
-        mixed_precision=config['mixed_precision'],
-        gradient_accumulation_steps=1,
-        log_with="tensorboard",
-        project_dir=log_dir,
-        kwargs_handlers=[ddp_kwargs]
-    )
+    accelerator = Accelerator(mixed_precision='no')
     config['device'] = accelerator.device
-    
-    # Print distributed training info
-    if accelerator.is_main_process:
-        print(f'Distributed training: {accelerator.distributed_type}')
-        print(f'Number of processes: {accelerator.num_processes}')
-        print(f'Mixed precision: {config["mixed_precision"]}')
-    print(f'Process {accelerator.process_index} using device: {config["device"]}')
+    print('Using Device: ', config['device'])
 
     model_name = config['model']
     model = MODEL[model_name](config)
 
-    # Load pretrained encoder weights if specified
-    pretrained_encoder_path = config.get('pretrained_encoder_path', None)
-    if pretrained_encoder_path and model_name == 'CompressedAD':
-        if path.exists(pretrained_encoder_path):
-            if accelerator.is_main_process:
-                print(f'\nLoading pretrained encoder from {pretrained_encoder_path}')
-            
-            checkpoint = torch.load(pretrained_encoder_path, map_location='cpu')
-            
-            # Load encoder weights
-            model.encoder.load_state_dict(checkpoint['encoder_state_dict'])
-            
-            # Load embedding weights (shared between encoder and decoder)
-            model.embed_context.load_state_dict(checkpoint['embed_context_state_dict'])
-            model.embed_ln.load_state_dict(checkpoint['embed_ln_state_dict'])
-            
-            if accelerator.is_main_process:
-                print(f'Successfully loaded pretrained encoder from step {checkpoint.get("global_step", "unknown")}')
-            
-            # Optionally freeze encoder
-            if config.get('freeze_encoder', False):
-                if accelerator.is_main_process:
-                    print('Freezing encoder and shared embedding weights')
-                # Freeze encoder
-                for param in model.encoder.parameters():
-                    param.requires_grad = False
-                # Freeze shared embeddings (they were trained with encoder during pre-training)
-                for param in model.embed_context.parameters():
-                    param.requires_grad = False
-                for param in model.embed_ln.parameters():
-                    param.requires_grad = False
-        else:
-            if accelerator.is_main_process:
-                print(f'WARNING: Pretrained encoder path specified but not found: {pretrained_encoder_path}')
-
     load_start_time = datetime.now()
     print(f'Data loading started at {load_start_time}')
 
-    # Use compressed dataset for CompressedAD model
-    if model_name == 'CompressedAD':
-        train_dataset = ADCompressedDataset(config, config['traj_dir'], 'train', config['train_n_stream'], config['train_source_timesteps'])
-        test_dataset = ADCompressedDataset(config, config['traj_dir'], 'test', 1, config['train_source_timesteps'])
-        
-        # Use custom collate function and bucket sampler for compressed dataset
-        from torch.utils.data import DataLoader
-        from dataset import BucketSampler
-        
-        # BucketSampler groups samples by compression depth
-        train_sampler = BucketSampler(
-            train_dataset,
-            batch_size=config['train_batch_size'],
-            shuffle=True,
-            drop_last=False
-        )
-        
-        train_dataloader = DataLoader(
-            train_dataset,
-            batch_sampler=train_sampler,
-            num_workers=0,  # Use 0 workers with batch_sampler to avoid multiprocessing issues
-            collate_fn=collate_compressed_batch,
-            pin_memory=True
-        )
-        train_dataloader = next_dataloader(train_dataloader)
-        
-        test_sampler = BucketSampler(
-            test_dataset,
-            batch_size=config['test_batch_size'],
-            shuffle=False,
-            drop_last=False
-        )
-        
-        test_dataloader = DataLoader(
-            test_dataset,
-            batch_sampler=test_sampler,
-            num_workers=0,  # Use 0 workers with batch_sampler to avoid multiprocessing issues
-            collate_fn=collate_compressed_batch,
-            pin_memory=True
-        )
-    else:
-        # Standard AD dataset
-        train_dataset = ADDataset(config, config['traj_dir'], 'train', config['train_n_stream'], config['train_source_timesteps'])
-        test_dataset = ADDataset(config, config['traj_dir'], 'test', 1, config['train_source_timesteps'])
+    train_dataset = ADDataset(config, config['traj_dir'], 'train', config['train_n_stream'], config['train_source_timesteps'])
+    test_dataset = ADDataset(config, config['traj_dir'], 'test', 1, config['train_source_timesteps'])
 
-        train_dataloader = get_data_loader(train_dataset, batch_size=config['train_batch_size'], config=config, shuffle=True)
-        train_dataloader = next_dataloader(train_dataloader)
+    train_dataloader = get_data_loader(train_dataset, batch_size=config['train_batch_size'], config=config, shuffle=True)
+    train_dataloader = next_dataloader(train_dataloader)
 
-        test_dataloader = get_data_loader(test_dataset, batch_size=config['test_batch_size'], config=config, shuffle=False)
+    test_dataloader = get_data_loader(test_dataset, batch_size=config['test_batch_size'], config=config, shuffle=False)
     
     load_end_time = datetime.now()
     print()
@@ -196,11 +103,9 @@ if __name__ == '__main__':
     model, optimizer, train_dataloader, lr_sched = accelerator.prepare(model, optimizer, train_dataloader, lr_sched)
 
     start_time = datetime.now()
-    if accelerator.is_main_process:
-        print(f'Training started at {start_time}')
+    print(f'Trainig started at {start_time}')
 
-    # Only show progress bar on main process
-    with tqdm(total=config['train_timesteps'], position=0, leave=True, disable=not accelerator.is_local_main_process) as pbar:
+    with tqdm(total=config['train_timesteps'], position=0, leave=True, disable=False) as pbar:
         pbar.update(step)
 
         while True:
@@ -223,24 +128,19 @@ if __name__ == '__main__':
 
             pbar.set_postfix(loss=loss.item())
 
-            # Logging only on main process
-            if step % config['summary_interval'] == 0 and accelerator.is_main_process:
+            if step % config['summary_interval'] == 0:
                 writer.add_scalar('train/loss', loss.item(), step)
                 writer.add_scalar('train/loss_action', output['loss_action'], step)
                 writer.add_scalar('train/lr', lr_sched.get_last_lr()[0], step)
                 writer.add_scalar('train/acc_action', output['acc_action'].item(), step)
-                if 'loss_reconstruct' in output:
-                    writer.add_scalar('train/loss_reconstruct', output['loss_reconstruct'].item(), step)
 
 
-            # Eval - synchronize all processes before evaluation
+            # Eval
             if step % config['eval_interval'] == 0:
-                accelerator.wait_for_everyone()  # Synchronize all processes
                 torch.cuda.empty_cache()
                 model.eval()
-                if accelerator.is_main_process:
-                    eval_start_time = datetime.now()
-                    print(f'Evaluating started at {eval_start_time}')
+                eval_start_time = datetime.now()
+                print(f'Evaluating started at {eval_start_time}')
 
                 with torch.no_grad():
                     test_loss_action = 0.0
@@ -253,13 +153,7 @@ if __name__ == '__main__':
 
                     for j, batch in enumerate(test_dataloader):
                         output = model(batch)
-                        
-                        # Handle both standard AD and CompressedAD batch formats
-                        if 'states' in batch:
-                            cnt = len(batch['states'])
-                        else:
-                            cnt = len(batch['query_states'])
-                        
+                        cnt = len(batch['states'])
                         test_loss_action += output['loss_action'].item() * cnt
                         test_acc_action += output['acc_action'].item() * cnt
                             
@@ -271,61 +165,43 @@ if __name__ == '__main__':
                             
                         test_cnt += cnt
 
-                # Only log on main process
-                if accelerator.is_main_process:
-                    writer.add_scalar('test/loss_action', test_loss_action / test_cnt, step)
-                    writer.add_scalar('test/acc_action', test_acc_action / test_cnt, step)              
+                writer.add_scalar('test/loss_action', test_loss_action / test_cnt, step)
+                writer.add_scalar('test/acc_action', test_acc_action / test_cnt, step)              
 
-                    eval_end_time = datetime.now()
-                    print()
-                    print(f'Evaluating ended at {eval_end_time}')
-                    print(f'Elapsed time: {eval_end_time - eval_start_time}')
-                
+                eval_end_time = datetime.now()
+                print()
+                print(f'Evaluating ended at {eval_end_time}')
+                print(f'Elapsed time: {eval_end_time - eval_start_time}')
                 model.train()
                 torch.cuda.empty_cache()
-                accelerator.wait_for_everyone()  # Synchronize after evaluation
 
             pbar.update(1)
 
-            # LOGGING - only save on main process
+            # LOGGING
             if step % config['ckpt_interval'] == 0:
-                accelerator.wait_for_everyone()  # Synchronize before saving
-                
-                if accelerator.is_main_process:
-                    # Remove old checkpoints
-                    ckpt_paths = sorted(glob(path.join(config['log_dir'], 'ckpt-*.pt')))
-                    for ckpt_path in ckpt_paths:
-                        os.remove(ckpt_path)
+                # Remove old checkpoints
+                ckpt_paths = sorted(glob(path.join(config['log_dir'], 'ckpt-*.pt')))
+                for ckpt_path in ckpt_paths:
+                    os.remove(ckpt_path)
 
-                    new_ckpt_path = path.join(config['log_dir'], f'ckpt-{step}.pt')
+                new_ckpt_path = path.join(config['log_dir'], f'ckpt-{step}.pt')
 
-                    # Unwrap model to get original state dict
-                    unwrapped_model = accelerator.unwrap_model(model)
-                    
-                    torch.save({
-                        'step': step,
-                        'config': config,
-                        'model': unwrapped_model.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'lr_sched': lr_sched.state_dict(),
-                    }, new_ckpt_path)
-                    print(f'\nCheckpoint saved to {new_ckpt_path}')
-                
-                accelerator.wait_for_everyone()  # Wait for checkpoint to be saved
+                torch.save({
+                    'step': step,
+                    'config': config,
+                    'model': model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'lr_sched': lr_sched.state_dict(),
+                }, new_ckpt_path)
+                print(f'\nCheckpoint saved to {new_ckpt_path}')
 
             if step >= config['train_timesteps']:
                 break
 
-    # Final synchronization
-    accelerator.wait_for_everyone()
-    
-    if accelerator.is_main_process:
-        writer.flush()
-    
+    writer.flush()
     envs.close()
 
-    if accelerator.is_main_process:
-        end_time = datetime.now()
-        print()
-        print(f'Training ended at {end_time}')
-        print(f'Elapsed time: {end_time - start_time}')
+    end_time = datetime.now()
+    print()
+    print(f'Training ended at {end_time}')
+    print(f'Elapsed time: {end_time - start_time}')
