@@ -5,8 +5,16 @@ import torch.nn.functional as F
 from einops import pack, rearrange, repeat
 
 from env import map_dark_states, map_dark_states_inverse
+from .gpt2 import GPT2Transformer
+
 
 class AD(torch.nn.Module):
+    """
+    Algorithm Distillation with GPT-2 style decoder-only transformer.
+    
+    Uses Pre-LayerNorm architecture as in the original GPT-2 paper,
+    which provides better training stability.
+    """
     def __init__(self, config):
         super(AD, self).__init__()
 
@@ -21,60 +29,26 @@ class AD(torch.nn.Module):
         tf_n_head = config.get('tf_n_head', 4)
         tf_n_layer = config.get('tf_n_layer', 4)
         tf_dim_feedforward = config.get('tf_dim_feedforward', tf_n_embd * 4)
-        self.pos_embedding = nn.Parameter(torch.zeros(1, self.max_seq_length, tf_n_embd))
-        
-        # Register causal mask buffer (will be created when needed)
-        self.register_buffer('causal_mask', None, persistent=False)
+        tf_dropout = config.get('tf_dropout', 0.1)
 
-        encoder_layer = nn.TransformerEncoderLayer(
+        # GPT-2 style transformer (Pre-LayerNorm, causal)
+        self.transformer = GPT2Transformer(
             d_model=tf_n_embd,
-            nhead=tf_n_head,
+            n_heads=tf_n_head,
+            n_layers=tf_n_layer,
+            max_seq_length=self.max_seq_length,
             dim_feedforward=tf_dim_feedforward,
-            activation='gelu',
-            batch_first=True,  # so inputs are (batch, seq, emb)
+            dropout=tf_dropout,
         )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=tf_n_layer)
 
+        # Input embeddings
         self.embed_context = nn.Linear(config['dim_states'] * 2 + config['num_actions'] + 1, tf_n_embd)
         self.embed_query_state = nn.Embedding(config['grid_size'] * config['grid_size'], tf_n_embd)
+        
+        # Output head
         self.pred_action = nn.Linear(tf_n_embd, config['num_actions'])
 
         self.loss_fn = nn.CrossEntropyLoss(reduction='mean', label_smoothing=config['label_smoothing'])
-
-        nn.init.trunc_normal_(self.pos_embedding, std=0.02)
-
-    def _apply_positional_embedding(self, x):
-        seq_len = x.size(1)
-        x = x + self.pos_embedding[:, :seq_len, :]
-        return x
-
-    def _get_causal_mask(self, seq_len):
-        """
-        Generate causal attention mask for autoregressive prediction.
-        Returns upper triangular matrix with -inf above diagonal.
-        """
-        if self.causal_mask is None or self.causal_mask.size(0) != seq_len:
-            # Create causal mask: upper triangular matrix with -inf
-            mask = torch.triu(torch.full((seq_len, seq_len), float('-inf')), diagonal=1)
-            self.causal_mask = mask.to(self.device)
-        return self.causal_mask
-    
-    def transformer(self, x, max_seq_length=None, dtype=None, use_causal_mask=True):
-        """
-        Thin wrapper so existing code calling self.transformer(...) still works.
-        We accept (batch, seq, emb) and return (batch, seq, emb).
-        dtype argument is accepted for API compatibility - we won't dynamically change types here.
-        use_causal_mask: if True, apply causal masking to prevent future token attention
-        """
-        x = self._apply_positional_embedding(x)
-        
-        if use_causal_mask:
-            seq_len = x.size(1)
-            attn_mask = self._get_causal_mask(seq_len)
-            out = self.transformer_encoder(x, mask=attn_mask)  # (batch, seq, emb)
-        else:
-            out = self.transformer_encoder(x)  # (batch, seq, emb)
-        return out
 
     def forward(self, x):
         query_states = x['query_states'].to(self.device)  # (batch_size, dim_state)
@@ -92,11 +66,8 @@ class AD(torch.nn.Module):
         context_embed = self.embed_context(context)
         context_embed, _ = pack([context_embed, query_states_embed], 'b * d')
 
-        # Apply causal masking during training to prevent future information leakage
-        transformer_output = self.transformer(context_embed,
-                                              max_seq_length=self.max_seq_length,
-                                              dtype=self.mixed_precision,
-                                              use_causal_mask=True)
+        # GPT-2 style transformer with causal masking
+        transformer_output = self.transformer(context_embed, use_causal_mask=True)
 
         result = {}
 
@@ -127,11 +98,8 @@ class AD(torch.nn.Module):
         for step in range(eval_timesteps):
             query_states_prev = query_states.clone().detach().to(torch.float)
 
-            # During evaluation, we still use causal masking for consistency
-            output = self.transformer(transformer_input,
-                                        max_seq_length=self.max_seq_length,
-                                        dtype='fp32',
-                                        use_causal_mask=True)
+            # GPT-2 style transformer with causal masking
+            output = self.transformer(transformer_input, use_causal_mask=True)
 
             logits = self.pred_action(output[:, -1])
 

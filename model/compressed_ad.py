@@ -5,6 +5,8 @@ This model extends the original AD with a compression mechanism:
 1. When sequence length exceeds max_seq_length, compress older history into latent tokens
 2. Continue AD with [latent_tokens, recent_transitions, query_state]
 3. Repeat compression as needed for very long sequences
+
+Uses GPT-2 style Pre-LayerNorm transformer architecture.
 """
 
 import numpy as np
@@ -15,9 +17,16 @@ from einops import pack, rearrange, repeat
 
 from env import map_dark_states, map_dark_states_inverse
 from .compression import CompressionTransformer, ReconstructionDecoder
+from .gpt2 import GPT2Transformer
 
 
 class CompressedAD(nn.Module):
+    """
+    Compressed Algorithm Distillation with GPT-2 style decoder-only transformer.
+    
+    Uses Pre-LayerNorm architecture as in the original GPT-2 paper,
+    with an additional compression transformer for handling long sequences.
+    """
     def __init__(self, config):
         super(CompressedAD, self).__init__()
 
@@ -43,22 +52,17 @@ class CompressedAD(nn.Module):
         tf_n_head = config.get('tf_n_head', 4)
         tf_n_layer = config.get('tf_n_layer', 4)
         tf_dim_feedforward = config.get('tf_dim_feedforward', tf_n_embd * 4)
-        
-        # AD Transformer positional embedding
-        self.pos_embedding = nn.Parameter(torch.zeros(1, self.max_seq_length, tf_n_embd))
-        
-        # Register causal mask buffer
-        self.register_buffer('causal_mask', None, persistent=False)
+        tf_dropout = config.get('tf_dropout', 0.1)
 
-        # AD Transformer encoder
-        encoder_layer = nn.TransformerEncoderLayer(
+        # GPT-2 style AD Transformer (Pre-LayerNorm, causal)
+        self.ad_transformer = GPT2Transformer(
             d_model=tf_n_embd,
-            nhead=tf_n_head,
+            n_heads=tf_n_head,
+            n_layers=tf_n_layer,
+            max_seq_length=self.max_seq_length,
             dim_feedforward=tf_dim_feedforward,
-            activation='gelu',
-            batch_first=True,
+            dropout=tf_dropout,
         )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=tf_n_layer)
 
         # Embeddings (shared between AD and compression)
         self.embed_context = nn.Linear(config['dim_states'] * 2 + config['num_actions'] + 1, tf_n_embd)
@@ -91,77 +95,61 @@ class CompressedAD(nn.Module):
         self.loss_fn = nn.CrossEntropyLoss(reduction='mean', label_smoothing=config['label_smoothing'])
 
         # Initialize weights
-        nn.init.trunc_normal_(self.pos_embedding, std=0.02)
         nn.init.trunc_normal_(self.latent_type_embedding, std=0.02)
 
-    def _apply_positional_embedding(self, x, has_latent_prefix=False):
+    def _get_attention_mask_for_latent(self, seq_len):
         """
-        Apply positional embeddings.
-        If has_latent_prefix, latent tokens get special treatment.
-        """
-        seq_len = x.size(1)
-        
-        if has_latent_prefix:
-            # Latent tokens: positions 0 to n_compress-1
-            # Recent tokens: continue from n_compress
-            latent_pos = self.pos_embedding[:, :self.n_compress_tokens, :]
-            recent_len = seq_len - self.n_compress_tokens
-            recent_pos = self.pos_embedding[:, self.n_compress_tokens:self.n_compress_tokens + recent_len, :]
-            pos = torch.cat([latent_pos, recent_pos], dim=1)
-            
-            # Also add latent type embedding to latent tokens
-            latent_type = self.latent_type_embedding.expand(-1, self.n_compress_tokens, -1)
-            zero_type = torch.zeros(1, recent_len, x.size(2), device=x.device)
-            type_emb = torch.cat([latent_type, zero_type], dim=1)
-            
-            x = x + pos + type_emb
-        else:
-            x = x + self.pos_embedding[:, :seq_len, :]
-            
-        return x
-
-    def _get_causal_mask(self, seq_len, has_latent_prefix=False):
-        """
-        Generate attention mask.
-        If has_latent_prefix: all tokens can attend to latent tokens, 
+        Generate attention mask for sequences with latent prefix.
+        All tokens can attend to latent tokens (first n_compress_tokens),
         but recent tokens use causal masking among themselves.
+        
+        Returns a boolean mask where True means "mask out" (don't attend).
         """
-        if has_latent_prefix:
-            # Create mask where:
-            # - All tokens can see latent tokens (first n_compress_tokens)
-            # - Recent tokens have causal masking among themselves
-            mask = torch.zeros((seq_len, seq_len), device=self.device)
-            recent_start = self.n_compress_tokens
-            recent_len = seq_len - recent_start
-            
-            # Causal mask for recent tokens attending to each other
+        # Create mask: False = can attend, True = masked
+        mask = torch.zeros((seq_len, seq_len), dtype=torch.bool, device=self.device)
+        recent_start = self.n_compress_tokens
+        recent_len = seq_len - recent_start
+        
+        # Causal mask for recent tokens attending to each other
+        if recent_len > 0:
             recent_mask = torch.triu(
-                torch.full((recent_len, recent_len), float('-inf'), device=self.device), 
+                torch.ones((recent_len, recent_len), dtype=torch.bool, device=self.device), 
                 diagonal=1
             )
             mask[recent_start:, recent_start:] = recent_mask
-            
-            return mask
-        else:
-            # Standard causal mask
-            if self.causal_mask is None or self.causal_mask.size(0) != seq_len:
-                mask = torch.triu(torch.full((seq_len, seq_len), float('-inf'), device=self.device), diagonal=1)
-                self.causal_mask = mask
-            return self.causal_mask
-    
-    def transformer(self, x, has_latent_prefix=False, use_causal_mask=True):
-        """
-        AD Transformer forward pass.
-        """
-        x = self._apply_positional_embedding(x, has_latent_prefix=has_latent_prefix)
         
-        if use_causal_mask:
-            seq_len = x.size(1)
-            attn_mask = self._get_causal_mask(seq_len, has_latent_prefix=has_latent_prefix)
-            out = self.transformer_encoder(x, mask=attn_mask)
+        return mask
+
+    def _forward_ad_transformer(self, x, has_latent_prefix=False):
+        """
+        Forward pass through AD transformer with proper masking.
+        
+        Args:
+            x: (batch, seq_len, d_model) - input embeddings
+            has_latent_prefix: whether the input starts with latent tokens
+            
+        Returns:
+            output: (batch, seq_len, d_model)
+        """
+        if has_latent_prefix:
+            # Add latent type embedding to latent tokens
+            batch_size = x.shape[0]
+            seq_len = x.shape[1]
+            recent_len = seq_len - self.n_compress_tokens
+            
+            latent_type = self.latent_type_embedding.expand(batch_size, self.n_compress_tokens, -1)
+            zero_type = torch.zeros(batch_size, recent_len, x.size(2), device=x.device)
+            type_emb = torch.cat([latent_type, zero_type], dim=1)
+            x = x + type_emb
+            
+            # Get attention mask for latent prefix
+            attn_mask = self._get_attention_mask_for_latent(seq_len)
+            output = self.ad_transformer(x, attention_mask=attn_mask, use_causal_mask=False)
         else:
-            out = self.transformer_encoder(x)
-        return out
+            # Standard causal masking
+            output = self.ad_transformer(x, use_causal_mask=True)
+        
+        return output
 
     def _compress_sequence(self, context_embed, compression_round):
         """
@@ -209,7 +197,7 @@ class CompressedAD(nn.Module):
         if context_len <= available_for_context:
             # No compression needed - standard forward
             full_input, _ = pack([context_embed, query_states_embed], 'b * d')
-            transformer_output = self.transformer(full_input, has_latent_prefix=False, use_causal_mask=True)
+            transformer_output = self._forward_ad_transformer(full_input, has_latent_prefix=False)
             return transformer_output, compression_info
         
         # Compression is needed
@@ -271,10 +259,10 @@ class CompressedAD(nn.Module):
         # Build final input for AD transformer
         if latent_tokens is not None:
             full_input, _ = pack([latent_tokens, remaining_context, query_states_embed], 'b * d')
-            transformer_output = self.transformer(full_input, has_latent_prefix=True, use_causal_mask=True)
+            transformer_output = self._forward_ad_transformer(full_input, has_latent_prefix=True)
         else:
             full_input, _ = pack([remaining_context, query_states_embed], 'b * d')
-            transformer_output = self.transformer(full_input, has_latent_prefix=False, use_causal_mask=True)
+            transformer_output = self._forward_ad_transformer(full_input, has_latent_prefix=False)
         
         compression_info['recon_loss'] = total_recon_loss
         
@@ -393,8 +381,8 @@ class CompressedAD(nn.Module):
                 transformer_input = query_states_embed
                 has_latent = False
 
-            # Forward through AD transformer
-            output = self.transformer(transformer_input, has_latent_prefix=has_latent, use_causal_mask=True)
+            # Forward through AD transformer (GPT-2 style)
+            output = self._forward_ad_transformer(transformer_input, has_latent_prefix=has_latent)
             logits = self.pred_action(output[:, -1])
 
             if sample:
