@@ -54,7 +54,7 @@ if __name__ == '__main__':
     config_save_path = path.join(config['log_dir'], 'config.yaml')
     
     config['traj_dir'] = './datasets'
-    config['mixed_precision'] = 'fp32'
+    config['mixed_precision'] = 'fp16'  # 'no' for fp32, or 'fp16'/'bf16' for mixed precision
 
     # Initialize accelerator for multi-GPU support
     accelerator = Accelerator(
