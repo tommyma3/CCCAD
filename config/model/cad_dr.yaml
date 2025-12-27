@@ -12,9 +12,9 @@ tf_n_inner: 128
 n_transit: 240  
 
 # Compression Settings
-n_compress_tokens: 40
-compress_n_layers: 2
-compress_n_heads: 4
+n_compress_tokens: 64   # Increase from 40
+compress_n_layers: 3    # Increase from 2
+compress_n_heads: 8     # Increase from 4
 
 # Gradient control for stability
 max_gradient_rounds: 2  # Detach gradients after this many compression rounds
@@ -35,7 +35,7 @@ lr: 0.0003
 train_batch_size: 256  # Smaller batch for longer sequences
 test_batch_size: 512
 train_source_timesteps: 1000
-train_timesteps: 50000
+train_timesteps: 100000
 num_warmup_steps: 1000  
 
 num_workers: 4
