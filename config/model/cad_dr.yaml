@@ -32,8 +32,8 @@ max_context_length: 800
 
 # Training
 lr: 0.0003  
-train_batch_size: 256  # Smaller batch for longer sequences
-test_batch_size: 512
+train_batch_size: 128  # Reduced for memory with larger compression model
+test_batch_size: 256
 train_source_timesteps: 1000
 train_timesteps: 100000
 num_warmup_steps: 1000  

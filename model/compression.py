@@ -196,7 +196,8 @@ class ReconstructionDecoder(nn.Module):
         
         self.d_model = d_model
         # Use larger max_seq_length for variable-length reconstruction during fine-tuning
-        self.max_seq_length = max(max_seq_length, 2048)
+        # Note: 1024 is sufficient for max_context_length=800 + some buffer
+        self.max_seq_length = max(max_seq_length, 1024)
         
         if dim_feedforward is None:
             dim_feedforward = d_model * 4
