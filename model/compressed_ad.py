@@ -434,28 +434,15 @@ class CompressedAD(nn.Module):
                 max_buffer_len = self.max_seq_length - 1
 
             if transition_buffer.shape[1] >= max_buffer_len:
-                # Compress - but keep recent transitions to match training behavior
-                # During training, remaining_context is kept after compression
-                # We need to match: [latent] + [recent_buffer] + [query]
-                
-                # Calculate how many to keep (same logic as training)
-                # available_for_new = max_seq_length - n_compress_tokens - 1
-                keep_recent = self.max_seq_length - self.n_compress_tokens - 1
-                
+                # Compress
                 if latent_tokens is not None:
-                    # Compress: [old_latent] + [older transitions]
-                    # Keep: [recent transitions]
-                    compress_len = transition_buffer.shape[1] - keep_recent + self.n_compress_tokens
-                    compress_input = torch.cat([latent_tokens, transition_buffer[:, :compress_len - self.n_compress_tokens]], dim=1)
-                    transition_buffer = transition_buffer[:, compress_len - self.n_compress_tokens:]
+                    compress_input = torch.cat([latent_tokens, transition_buffer], dim=1)
                 else:
-                    # First compression
-                    compress_len = transition_buffer.shape[1] - keep_recent + self.n_compress_tokens
-                    compress_input = transition_buffer[:, :compress_len]
-                    transition_buffer = transition_buffer[:, compress_len:]  # Keep recent
+                    compress_input = transition_buffer
                 
                 # Perform compression
                 latent_tokens = self.compression_transformer(compress_input)
+                transition_buffer = None  # Reset buffer
                 
                 compression_count += 1
                 outputs['compression_events'].append(step)
