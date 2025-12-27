@@ -91,7 +91,7 @@ if __name__ == '__main__':
     
     config['log_dir'] = log_dir
     config['traj_dir'] = './datasets'
-    config['mixed_precision'] = 'fp32'
+    config['mixed_precision'] = 'fp16'
 
     # Initialize accelerator for multi-GPU support
     accelerator = Accelerator(
@@ -180,6 +180,9 @@ if __name__ == '__main__':
         start_time = datetime.now()
         print(f'Pre-training started at {start_time}')
 
+    # Get unwrapped model for calling custom methods (DDP wrapping hides them)
+    unwrapped_model = accelerator.unwrap_model(model)
+
     # Training loop
     with tqdm(total=config['pretrain_timesteps'], position=0, leave=True, disable=not is_main) as pbar:
         pbar.update(step)
@@ -190,7 +193,7 @@ if __name__ == '__main__':
             step += 1
             
             with accelerator.autocast():
-                output = model.forward_pretrain_compression(batch)
+                output = unwrapped_model.forward_pretrain_compression(batch)
             
             loss = output['loss_recon']
 

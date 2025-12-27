@@ -466,10 +466,23 @@ class CompressedAD(nn.Module):
                            if 'compression_transformer' in k}
         self.compression_transformer.load_state_dict(compression_state)
         
-        # Load reconstruction decoder
+        # Load reconstruction decoder (handle potential shape mismatch in position_queries)
         decoder_state = {k.replace('reconstruction_decoder.', ''): v 
                         for k, v in checkpoint['model'].items() 
                         if 'reconstruction_decoder' in k}
+        
+        # Handle position_queries shape mismatch (pretrain uses smaller max_seq_length)
+        if 'position_queries' in decoder_state:
+            pretrained_pos_queries = decoder_state['position_queries']
+            current_pos_queries = self.reconstruction_decoder.position_queries
+            
+            if pretrained_pos_queries.shape != current_pos_queries.shape:
+                # Copy pretrained weights into the beginning of the larger tensor
+                pretrained_len = pretrained_pos_queries.shape[1]
+                new_pos_queries = current_pos_queries.clone()
+                new_pos_queries[:, :pretrained_len, :] = pretrained_pos_queries
+                decoder_state['position_queries'] = new_pos_queries
+        
         self.reconstruction_decoder.load_state_dict(decoder_state)
         
         # Load embedding layer (shared)

@@ -115,11 +115,16 @@ class CompressedADDataset(Dataset):
             'long': 0.3,       # 2-3 compressions: 450-700
             'very_long': 0.2,  # 4+ compressions: 750-1000
         })
+
+        assert self.length_distribution['short'] + \
+                self.length_distribution['medium'] + \
+                self.length_distribution['long'] + \
+                self.length_distribution['very_long'] == 1.0
         
         if self.env == 'darkroom':
             n_total_envs = config['grid_size'] ** 2
         else:
-            raise ValueError('Invalid env')
+            raise ValueError('Invalid environment')
 
         total_env_idx = list(range(n_total_envs))
         random.seed(config['env_split_seed'])

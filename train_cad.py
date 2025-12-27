@@ -159,7 +159,7 @@ if __name__ == '__main__':
     
     config['log_dir'] = log_dir
     config['traj_dir'] = './datasets'
-    config['mixed_precision'] = 'fp32'
+    config['mixed_precision'] = 'fp16'
 
     # Curriculum settings
     use_curriculum = not args.no_curriculum

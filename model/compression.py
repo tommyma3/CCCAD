@@ -195,13 +195,14 @@ class ReconstructionDecoder(nn.Module):
         super().__init__()
         
         self.d_model = d_model
-        self.max_seq_length = max_seq_length
+        # Use larger max_seq_length for variable-length reconstruction during fine-tuning
+        self.max_seq_length = max(max_seq_length, 2048)
         
         if dim_feedforward is None:
             dim_feedforward = d_model * 4
         
         # Learnable position queries for reconstruction
-        self.position_queries = nn.Parameter(torch.randn(1, max_seq_length, d_model) * 0.02)
+        self.position_queries = nn.Parameter(torch.randn(1, self.max_seq_length, d_model) * 0.02)
         
         # Decoder layers
         self.layers = nn.ModuleList([
@@ -224,6 +225,10 @@ class ReconstructionDecoder(nn.Module):
             reconstructed: (batch, target_length, d_model)
         """
         batch_size = latent_tokens.shape[0]
+        
+        # Validate target_length doesn't exceed max_seq_length
+        if target_length > self.max_seq_length:
+            raise ValueError(f"target_length ({target_length}) exceeds max_seq_length ({self.max_seq_length})")
         
         # Use position queries up to target length
         queries = self.position_queries[:, :target_length, :].expand(batch_size, -1, -1)

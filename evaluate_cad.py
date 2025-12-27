@@ -102,7 +102,7 @@ if __name__ == '__main__':
     print("="*60)
     
     for i in range(len(test_env_args)):
-        print(f'Env {i} (goal={test_env_args[i]}): mean={test_rewards[i].mean():.3f}, std={test_rewards[i].std():.3f}')
+        print(f'Env {i} (goal={test_env_args[i]}): {test_rewards[i]} , mean={test_rewards[i].mean():.3f}, std={test_rewards[i].std():.3f}')
 
     print("\n" + "-"*60)
     print(f"Mean reward per environment: {test_rewards.mean(axis=1)}")
