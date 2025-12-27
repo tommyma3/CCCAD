@@ -11,16 +11,16 @@ tf_attn_dropout: 0.1
 tf_n_inner: 128
 n_transit: 240  
 
-# Compression Settings
-n_compress_tokens: 40
-compress_n_layers: 2
-compress_n_heads: 4
+# Compression Settings (must match cad_dr.yaml)
+n_compress_tokens: 64
+compress_n_layers: 3
+compress_n_heads: 8
 
 # Pre-training specific
-pretrain_timesteps: 10000
-pretrain_batch_size: 512
+pretrain_timesteps: 50000
+pretrain_batch_size: 256
 pretrain_lr: 0.0005
-pretrain_warmup_steps: 500
+pretrain_warmup_steps: 1000
 
 # Dataset
 train_source_timesteps: 1000
