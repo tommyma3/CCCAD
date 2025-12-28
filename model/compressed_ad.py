@@ -440,27 +440,9 @@ class CompressedAD(nn.Module):
                 else:
                     compress_input = transition_buffer
                 
-                # Compute what to keep: mimic training behavior
-                # During training: keeps (available_for_new - n_compress_tokens) recent transitions
-                # available_for_new = max_seq_length - n_compress_tokens - 1
-                # So keep: max_seq_length - 2*n_compress_tokens - 1 transitions
-                keep_recent = self.max_seq_length - 2 * self.n_compress_tokens - 1
-                keep_recent = max(0, keep_recent)  # Safety check
-                
-                # Perform compression on older part
-                if keep_recent > 0 and transition_buffer.shape[1] > keep_recent:
-                    # Only compress the older part, keep recent transitions
-                    if latent_tokens is not None:
-                        compress_input = torch.cat([latent_tokens, transition_buffer[:, :-keep_recent]], dim=1)
-                    else:
-                        compress_input = transition_buffer[:, :-keep_recent]
-                    transition_buffer = transition_buffer[:, -keep_recent:]  # Keep recent
-                else:
-                    # Compress everything (for very small keep_recent)
-                    transition_buffer = None
-                
                 # Perform compression
                 latent_tokens = self.compression_transformer(compress_input)
+                transition_buffer = None  # Reset buffer
                 
                 compression_count += 1
                 outputs['compression_events'].append(step)
@@ -511,3 +493,4 @@ class CompressedAD(nn.Module):
             })
             
         print(f"Loaded pre-trained compression from {pretrain_checkpoint_path}")
+
