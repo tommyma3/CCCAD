@@ -95,6 +95,7 @@ class CompressedADDataset(Dataset):
     - Medium sequences (1 compression)
     - Long sequences (2-3 compressions)
     - Very long sequences (4+ compressions)
+    - Extended sequences (6+ compressions) for robust multi-compression learning
     """
     
     def __init__(self, config, traj_dir, mode='train', n_stream=None, source_timesteps=None):
@@ -108,18 +109,18 @@ class CompressedADDataset(Dataset):
         self.min_context = config.get('min_context_length', 50)
         self.max_context = config.get('max_context_length', 800)
         
-        # Length distribution (can be configured)
-        self.length_distribution = config.get('length_distribution', {
+        # Length distribution (can be configured) - supports extended distribution
+        default_distribution = {
             'short': 0.2,      # No compression: 50-200
             'medium': 0.3,     # 1 compression: 250-400  
             'long': 0.3,       # 2-3 compressions: 450-700
             'very_long': 0.2,  # 4+ compressions: 750-1000
-        })
-
-        assert self.length_distribution['short'] + \
-                self.length_distribution['medium'] + \
-                self.length_distribution['long'] + \
-                self.length_distribution['very_long'] == 1.0
+        }
+        self.length_distribution = config.get('length_distribution', default_distribution)
+        
+        # Validate distribution sums to 1.0
+        total_prob = sum(self.length_distribution.values())
+        assert abs(total_prob - 1.0) < 1e-6, f"Length distribution must sum to 1.0, got {total_prob}"
         
         if self.env == 'darkroom':
             n_total_envs = config['grid_size'] ** 2
@@ -166,23 +167,43 @@ class CompressedADDataset(Dataset):
         return self.n_histories * (self.seq_length - self.min_context)
     
     def _sample_context_length(self):
-        """Sample context length from distribution."""
+        """Sample context length from distribution supporting extended multi-compression training."""
         r = random.random()
         cumulative = 0
+        
+        # Maximum available context (leave room for query state)
+        max_available = self.seq_length - 1
         
         for category, prob in self.length_distribution.items():
             cumulative += prob
             if r < cumulative:
                 if category == 'short':
-                    return random.randint(50, min(200, self.n_transit - 1))
+                    # No compression needed
+                    low, high = 50, min(200, self.n_transit - 1)
                 elif category == 'medium':
-                    return random.randint(250, min(400, self.seq_length - 1))
+                    # ~1 compression
+                    low, high = 250, 400
                 elif category == 'long':
-                    return random.randint(450, min(700, self.seq_length - 1))
-                else:  # very_long
-                    return random.randint(750, min(self.max_context, self.seq_length - 1))
+                    # 2-3 compressions
+                    low, high = 450, 700
+                elif category == 'very_long':
+                    # 4-5 compressions
+                    low, high = 750, 1200
+                elif category == 'extended':
+                    # 6+ compressions - critical for learning multi-compression
+                    low, high = 1300, self.max_context
+                else:
+                    # Fallback for unknown categories
+                    low, high = self.min_context, self.max_context
+                
+                # Clamp to available data
+                high = min(high, max_available)
+                low = min(low, high)  # Ensure low <= high
+                
+                return random.randint(low, high)
         
-        return random.randint(self.min_context, min(self.max_context, self.seq_length - 1))
+        # Fallback
+        return random.randint(self.min_context, min(self.max_context, max_available))
     
     def __getitem__(self, i):
         # Use index for reproducibility but also allow randomness

@@ -12,30 +12,53 @@ tf_n_inner: 128
 n_transit: 240  
 
 # Compression Settings
-n_compress_tokens: 64   # Increase from 40
-compress_n_layers: 3    # Increase from 2
-compress_n_heads: 8     # Increase from 4
+n_compress_tokens: 64   
+compress_n_layers: 3    
+compress_n_heads: 8     
 
-# Gradient control for stability
-max_gradient_rounds: 2  # Detach gradients after this many compression rounds
+# Gradient control - allow more gradient rounds for better learning
+max_gradient_rounds: 3  # Increased from 2
 
 # Reconstruction regularization during fine-tuning
 use_recon_reg: True
-recon_reg_weight: 0.1
+recon_reg_weight: 0.05  # Reduced to let action loss dominate
 
 # Curriculum settings (None = unlimited)
 max_compressions: null
 
-# Dataset settings for variable-length training
+# Extended dataset settings for multi-compression training
+# With n_transit=240, compressions occur roughly every 175 steps
+# For 6 compressions we need ~1050+ context, for 8 compressions ~1400+ context
 min_context_length: 50
-max_context_length: 800
+max_context_length: 2000  # Increased from 800 to allow more compressions
 
-# Training
-lr: 0.0003  
-train_batch_size: 128  # Reduced for memory with larger compression model
+# Extended length distribution - emphasize multi-compression scenarios
+length_distribution:
+  short: 0.10      # No compression: 50-200 (~10% of training)
+  medium: 0.15     # 1 compression: 250-400 
+  long: 0.25       # 2-3 compressions: 450-700
+  very_long: 0.25  # 4-5 compressions: 750-1200
+  extended: 0.25   # 6+ compressions: 1300-2000
+
+# Training - longer training for better convergence
+lr: 0.0002  # Slightly lower LR for stability with longer sequences
+train_batch_size: 64  # Reduced batch size for memory with longer sequences
 test_batch_size: 256
-train_source_timesteps: 1000
-train_timesteps: 100000
-num_warmup_steps: 1000  
+train_source_timesteps: 2500  # Increased from 1000 to support longer contexts
+train_timesteps: 200000  # Longer training
+num_warmup_steps: 2000   # More warmup
 
 num_workers: 4
+
+# Extended curriculum - more gradual progression
+curriculum_schedule:
+  - step: 0
+    max_compressions: 1
+  - step: 10000
+    max_compressions: 2
+  - step: 30000
+    max_compressions: 4
+  - step: 60000
+    max_compressions: 6
+  - step: 100000
+    max_compressions: null  # Unlimited

@@ -21,6 +21,7 @@ import os.path as path
 from glob import glob
 import argparse
 
+import yaml
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 
@@ -114,6 +115,25 @@ DEFAULT_CURRICULUM = [
     (40000, None), # Unlimited
 ]
 
+# Extended curriculum for longer training with multi-compression
+EXTENDED_CURRICULUM = [
+    (0, 1),        # Start with max 1 compression
+    (10000, 2),    # Allow 2 compressions  
+    (30000, 4),    # Allow 4 compressions
+    (60000, 6),    # Allow 6 compressions
+    (100000, None), # Unlimited
+]
+
+
+def get_curriculum_from_config(config):
+    """Get curriculum schedule from config or use default."""
+    if 'curriculum_schedule' in config:
+        curriculum = []
+        for item in config['curriculum_schedule']:
+            curriculum.append((item['step'], item['max_compressions']))
+        return curriculum
+    return DEFAULT_CURRICULUM
+
 
 def get_curriculum_max_compressions(step, curriculum):
     """Get max compressions allowed at current step."""
@@ -130,6 +150,8 @@ if __name__ == '__main__':
                        help='Path to pre-trained compression checkpoint')
     parser.add_argument('--no_curriculum', action='store_true',
                        help='Disable curriculum learning')
+    parser.add_argument('--config', type=str, default='cad_dr',
+                       help='Model config name (without .yaml extension)')
     args = parser.parse_args()
     
     multiprocessing.set_start_method('spawn', force=True)
@@ -137,7 +159,7 @@ if __name__ == '__main__':
     # Load configs
     config = get_config('./config/env/darkroom.yaml')
     config.update(get_config('./config/algorithm/ppo_darkroom.yaml'))
-    config.update(get_config('./config/model/cad_dr.yaml'))
+    config.update(get_config(f'./config/model/{args.config}.yaml'))
 
     # Set seed for reproducibility
     set_seed(config.get('seed', 42))
@@ -154,16 +176,15 @@ if __name__ == '__main__':
         config_exists = False
 
     if config_exists:
-        print(f'WARNING: {log_dir} already exists. Skipping...')
-        exit(0)
+        print(f'WARNING: {log_dir} already exists. Will resume if checkpoint exists.')
     
     config['log_dir'] = log_dir
     config['traj_dir'] = './datasets'
     config['mixed_precision'] = 'fp16'
 
-    # Curriculum settings
+    # Curriculum settings - load from config or use default
     use_curriculum = not args.no_curriculum
-    curriculum = DEFAULT_CURRICULUM if use_curriculum else [(0, None)]
+    curriculum = get_curriculum_from_config(config) if use_curriculum else [(0, None)]
 
     # Initialize accelerator for multi-GPU support
     accelerator = Accelerator(
@@ -182,6 +203,15 @@ if __name__ == '__main__':
         print(f'Using Device: {config["device"]}')
         print(f'Number of processes: {accelerator.num_processes}')
         print(f'Curriculum enabled: {use_curriculum}')
+        print(f'Curriculum schedule: {curriculum}')
+        print(f'Max context length: {config.get("max_context_length", 800)}')
+        print(f'Train source timesteps: {config.get("train_source_timesteps", 1000)}')
+        print(f'Train timesteps: {config.get("train_timesteps", 100000)}')
+        
+        # Save config
+        config_save_path = path.join(log_dir, 'config.yaml')
+        with open(config_save_path, 'w') as f:
+            yaml.dump(config, f)
 
     # Create model
     model = MODEL[config['model']](config)
@@ -214,6 +244,10 @@ if __name__ == '__main__':
         config['train_n_stream'], 
         config['train_source_timesteps']
     )
+    
+    if is_main:
+        print(f'Dataset sequence length: {train_dataset.seq_length}')
+        print(f'Number of training histories: {train_dataset.n_histories}')
     
     # Use standard AD dataset for testing (fixed length)
     test_dataset = ADDataset(
@@ -295,6 +329,9 @@ if __name__ == '__main__':
         start_time = datetime.now()
         print(f'Training started at {start_time}')
 
+    # Track compression statistics
+    compression_counts = []
+
     # Training loop
     with tqdm(total=config['train_timesteps'], position=0, leave=True, disable=not is_main) as pbar:
         pbar.update(step)
@@ -315,6 +352,11 @@ if __name__ == '__main__':
             
             # Use total loss (action + reconstruction regularization)
             loss = output['loss_total']
+            
+            # Track compressions
+            compression_counts.append(output['num_compressions'])
+            if len(compression_counts) > 1000:
+                compression_counts.pop(0)
 
             optimizer.zero_grad()
             accelerator.backward(loss)
@@ -324,10 +366,12 @@ if __name__ == '__main__':
             if not accelerator.optimizer_step_was_skipped:
                 lr_sched.step()
 
+            avg_compressions = np.mean(compression_counts) if compression_counts else 0
             pbar.set_postfix(
                 loss=loss.item(), 
                 acc=output['acc_action'].item(),
-                n_comp=output['num_compressions']
+                n_comp=output['num_compressions'],
+                avg_comp=f'{avg_compressions:.2f}'
             )
 
             # Logging
@@ -338,6 +382,7 @@ if __name__ == '__main__':
                 writer.add_scalar('train/lr', lr_sched.get_last_lr()[0], step)
                 writer.add_scalar('train/acc_action', output['acc_action'].item(), step)
                 writer.add_scalar('train/num_compressions', output['num_compressions'], step)
+                writer.add_scalar('train/avg_compressions', avg_compressions, step)
                 
                 if use_curriculum:
                     curr_max = get_curriculum_max_compressions(step, curriculum)
