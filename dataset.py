@@ -167,7 +167,7 @@ class CompressedADDataset(Dataset):
         return self.n_histories * (self.seq_length - self.min_context)
     
     def _sample_context_length(self):
-        """Sample context length from distribution supporting extended multi-compression training."""
+        """Sample context length from distribution supporting multi-compression training."""
         r = random.random()
         cumulative = 0
         
@@ -187,11 +187,11 @@ class CompressedADDataset(Dataset):
                     # 2-3 compressions
                     low, high = 450, 700
                 elif category == 'very_long':
-                    # 4-5 compressions
-                    low, high = 750, 1200
+                    # 3-4 compressions
+                    low, high = 750, self.max_context
                 elif category == 'extended':
-                    # 6+ compressions - critical for learning multi-compression
-                    low, high = 1300, self.max_context
+                    # 5+ compressions (requires longer dataset)
+                    low, high = 1100, self.max_context
                 else:
                     # Fallback for unknown categories
                     low, high = self.min_context, self.max_context

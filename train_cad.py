@@ -20,6 +20,7 @@ import os
 import os.path as path
 from glob import glob
 import argparse
+import gc
 
 import yaml
 from accelerate import Accelerator
@@ -266,13 +267,19 @@ if __name__ == '__main__':
     )
     train_dataloader = next_dataloader(train_dataloader)
 
-    # Standard data loader for test
-    from utils import get_data_loader
-    test_dataloader = get_data_loader(
+    # Standard data loader for test - use fewer workers and no persistence to avoid leaks
+    from torch.utils.data import DataLoader
+    from functools import partial
+    from utils import ad_collate_fn
+    
+    test_collate_fn = partial(ad_collate_fn, grid_size=config['grid_size'])
+    test_dataloader = DataLoader(
         test_dataset, 
         batch_size=config['test_batch_size'], 
-        config=config, 
-        shuffle=False
+        shuffle=False,
+        collate_fn=test_collate_fn,
+        num_workers=0,  # Use main process to avoid worker issues during evaluation
+        persistent_workers=False
     )
     
     if is_main:
@@ -402,10 +409,10 @@ if __name__ == '__main__':
                     test_cnt = 0
 
                     for j, test_batch in enumerate(test_dataloader):
-                        output = model(test_batch)
+                        test_output = model(test_batch)
                         cnt = len(test_batch['states'])
-                        test_loss_action += output['loss_action'].item() * cnt
-                        test_acc_action += output['acc_action'].item() * cnt
+                        test_loss_action += test_output['loss_action'].item() * cnt
+                        test_acc_action += test_output['acc_action'].item() * cnt
                         test_cnt += cnt
 
                 writer.add_scalar('test/loss_action', test_loss_action / test_cnt, step)
@@ -414,8 +421,13 @@ if __name__ == '__main__':
                 eval_end_time = datetime.now()
                 print(f'Evaluating ended at {eval_end_time}')
                 print(f'Elapsed time: {eval_end_time - eval_start_time}')
+                
+                # Clean up evaluation tensors
+                del test_output, test_batch
+                
                 model.train()
                 torch.cuda.empty_cache()
+                gc.collect()
 
             # In-context evaluation (less frequent)
             if is_main and step % config['gen_interval'] == 0:
@@ -436,18 +448,24 @@ if __name__ == '__main__':
                     writer.add_scalar('eval/total_compressions', total_compressions, step)
                     
                     print(f'\nIn-context eval: mean_reward={mean_reward:.3f}, compressions={total_compressions}')
+                    
+                    del eval_output
                 
                 model.train()
                 torch.cuda.empty_cache()
+                gc.collect()
 
             pbar.update(1)
 
             # Save checkpoint
             if is_main and step % config['ckpt_interval'] == 0:
-                # Remove old checkpoints
+                # Remove old checkpoints with error handling
                 ckpt_paths = sorted(glob(path.join(config['log_dir'], 'ckpt-*.pt')))
                 for old_ckpt_path in ckpt_paths:
-                    os.remove(old_ckpt_path)
+                    try:
+                        os.remove(old_ckpt_path)
+                    except OSError:
+                        pass  # File may be in use, skip
 
                 new_ckpt_path = path.join(config['log_dir'], f'ckpt-{step}.pt')
                 
