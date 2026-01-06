@@ -116,33 +116,64 @@ DEFAULT_CURRICULUM = [
     (40000, None), # Unlimited
 ]
 
-# Extended curriculum for longer training with multi-compression
-EXTENDED_CURRICULUM = [
-    (0, 1),        # Start with max 1 compression
-    (10000, 2),    # Allow 2 compressions  
-    (30000, 4),    # Allow 4 compressions
-    (60000, 6),    # Allow 6 compressions
-    (100000, None), # Unlimited
-]
+# Default length distributions for each curriculum stage
+DEFAULT_LENGTH_DISTRIBUTIONS = {
+    1: {'short': 0.50, 'medium': 0.45, 'long': 0.05, 'very_long': 0.00},
+    2: {'short': 0.35, 'medium': 0.40, 'long': 0.20, 'very_long': 0.05},
+    3: {'short': 0.25, 'medium': 0.30, 'long': 0.30, 'very_long': 0.15},
+    None: {'short': 0.20, 'medium': 0.25, 'long': 0.30, 'very_long': 0.25},
+}
 
 
 def get_curriculum_from_config(config):
-    """Get curriculum schedule from config or use default."""
+    """
+    Get curriculum schedule from config or use default.
+    
+    Returns:
+        list of tuples: [(step, max_compressions, length_distribution), ...]
+    """
     if 'curriculum_schedule' in config:
         curriculum = []
         for item in config['curriculum_schedule']:
-            curriculum.append((item['step'], item['max_compressions']))
+            step = item['step']
+            max_comp = item['max_compressions']
+            # Get length distribution from config or use default
+            length_dist = item.get('length_distribution', 
+                                   DEFAULT_LENGTH_DISTRIBUTIONS.get(max_comp, DEFAULT_LENGTH_DISTRIBUTIONS[None]))
+            curriculum.append((step, max_comp, length_dist))
         return curriculum
-    return DEFAULT_CURRICULUM
+    # Default curriculum with default distributions
+    return [(0, 1, DEFAULT_LENGTH_DISTRIBUTIONS[1]),
+            (10000, 2, DEFAULT_LENGTH_DISTRIBUTIONS[2]),
+            (25000, 3, DEFAULT_LENGTH_DISTRIBUTIONS[3]),
+            (40000, None, DEFAULT_LENGTH_DISTRIBUTIONS[None])]
 
 
 def get_curriculum_max_compressions(step, curriculum):
     """Get max compressions allowed at current step."""
     max_comp = curriculum[0][1]
-    for threshold, comp in curriculum:
+    for threshold, comp, _ in curriculum:
         if step >= threshold:
             max_comp = comp
     return max_comp
+
+
+def get_curriculum_length_distribution(step, curriculum):
+    """Get length distribution for current curriculum stage."""
+    length_dist = curriculum[0][2]
+    for threshold, _, dist in curriculum:
+        if step >= threshold:
+            length_dist = dist
+    return length_dist
+
+
+def get_curriculum_stage(step, curriculum):
+    """Get the current curriculum stage index."""
+    stage = 0
+    for i, (threshold, _, _) in enumerate(curriculum):
+        if step >= threshold:
+            stage = i
+    return stage
 
 
 if __name__ == '__main__':
@@ -185,7 +216,7 @@ if __name__ == '__main__':
 
     # Curriculum settings - load from config or use default
     use_curriculum = not args.no_curriculum
-    curriculum = get_curriculum_from_config(config) if use_curriculum else [(0, None)]
+    curriculum = get_curriculum_from_config(config) if use_curriculum else [(0, None, DEFAULT_LENGTH_DISTRIBUTIONS[None])]
 
     # Initialize accelerator for multi-GPU support
     accelerator = Accelerator(
@@ -338,6 +369,9 @@ if __name__ == '__main__':
 
     # Track compression statistics
     compression_counts = []
+    
+    # Track current curriculum stage for length distribution updates
+    current_curriculum_stage = -1
 
     # Training loop
     with tqdm(total=config['train_timesteps'], position=0, leave=True, disable=not is_main) as pbar:
@@ -348,11 +382,21 @@ if __name__ == '__main__':
             
             step += 1
             
-            # Update curriculum
+            # Update curriculum (model max_compressions AND dataset length distribution)
             if use_curriculum:
                 max_comp = get_curriculum_max_compressions(step, curriculum)
                 unwrapped = accelerator.unwrap_model(model)
                 unwrapped.set_curriculum(max_comp)
+                
+                # Check if curriculum stage changed - update dataset length distribution
+                new_stage = get_curriculum_stage(step, curriculum)
+                if new_stage != current_curriculum_stage:
+                    current_curriculum_stage = new_stage
+                    new_length_dist = get_curriculum_length_distribution(step, curriculum)
+                    train_dataset.update_length_distribution(new_length_dist)
+                    if is_main:
+                        print(f'\n[Step {step}] Curriculum stage {new_stage}: max_comp={max_comp}, '
+                              f'length_dist={new_length_dist}')
             
             with accelerator.autocast():
                 output = model(batch)
@@ -395,6 +439,12 @@ if __name__ == '__main__':
                     curr_max = get_curriculum_max_compressions(step, curriculum)
                     writer.add_scalar('train/curriculum_max_compressions', 
                                     curr_max if curr_max is not None else -1, step)
+                    writer.add_scalar('train/curriculum_stage', current_curriculum_stage, step)
+                    
+                    # Log length distribution
+                    curr_dist = get_curriculum_length_distribution(step, curriculum)
+                    for category, prob in curr_dist.items():
+                        writer.add_scalar(f'train/length_dist_{category}', prob, step)
 
             # Evaluation
             if is_main and step % config['eval_interval'] == 0:

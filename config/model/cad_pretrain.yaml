@@ -2,25 +2,25 @@ include: config/model/ad_base.yaml
 
 model: CompressedAD
 
-# Compression Transformer (for pre-training)
-tf_n_embd: 64
-tf_n_layer: 4
-tf_n_head: 4
+# Compression Transformer (must match cad_dr.yaml)
+tf_n_embd: 128          # Match cad_dr.yaml
+tf_n_layer: 6           # Match cad_dr.yaml  
+tf_n_head: 8            # Match cad_dr.yaml
 tf_dropout: 0.1
 tf_attn_dropout: 0.1
-tf_n_inner: 128
+tf_n_inner: 256         # Match cad_dr.yaml
 n_transit: 240  
 
 # Compression Settings (must match cad_dr.yaml)
 n_compress_tokens: 64
-compress_n_layers: 3
+compress_n_layers: 4    # Match cad_dr.yaml
 compress_n_heads: 8
 
 # Pre-training specific
-pretrain_timesteps: 25000
-pretrain_batch_size: 512
-pretrain_lr: 0.0005
-pretrain_warmup_steps: 1000
+pretrain_timesteps: 30000   # Increased for larger model
+pretrain_batch_size: 256    # Reduced for larger model
+pretrain_lr: 0.0003         # Lower LR for larger model
+pretrain_warmup_steps: 1500
 
 # Dataset
 train_source_timesteps: 1000

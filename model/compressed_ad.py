@@ -170,13 +170,14 @@ class CompressedAD(nn.Module):
             
         return latent_tokens
 
-    def _forward_with_compression(self, context_embed, query_states_embed):
+    def _forward_with_compression(self, context_embed, query_states_embed, rewards=None):
         """
         Forward pass with rolling compression for long sequences.
         
         Args:
             context_embed: (batch, context_len, d_model) - all transition embeddings
             query_states_embed: (batch, 1, d_model) - query state embedding
+            rewards: (batch, context_len, 1) - optional rewards for weighted reconstruction
             
         Returns:
             transformer_output: (batch, seq_len, d_model)
@@ -184,6 +185,10 @@ class CompressedAD(nn.Module):
         """
         batch_size = context_embed.shape[0]
         context_len = context_embed.shape[1]
+        
+        # Track reward positions for weighted reconstruction
+        self._current_rewards = rewards
+        self._compressed_start_idx = 0
         
         # Calculate available space: max_seq_length - 1 (for query state)
         available_for_context = self.max_seq_length - 1
@@ -246,10 +251,29 @@ class CompressedAD(nn.Module):
             # Perform compression
             new_latent = self._compress_sequence(compress_input, compression_round)
             
-            # Optional: compute reconstruction loss for regularization
+            # Optional: compute reward-weighted reconstruction loss for regularization
+            # This gives higher weight to transitions with positive rewards (goal-finding)
             if self.training and self.use_recon_reg:
                 reconstructed = self.reconstruction_decoder(new_latent, compress_input.shape[1])
-                recon_loss = F.mse_loss(reconstructed, compress_input.detach())
+                
+                # Compute per-position MSE
+                position_mse = ((reconstructed - compress_input.detach()) ** 2).mean(dim=-1)  # (batch, seq_len)
+                
+                # Apply reward weighting if rewards are available
+                if self._current_rewards is not None and compression_round == 0:
+                    # Get rewards for the compressed positions
+                    compress_rewards = self._current_rewards[:, self._compressed_start_idx:self._compressed_start_idx + compress_end]
+                    compress_rewards = compress_rewards.squeeze(-1)  # (batch, seq_len)
+                    
+                    # Weight: 1.0 for zero-reward transitions, 5.0 for positive-reward transitions
+                    reward_weights = 1.0 + 4.0 * (compress_rewards > 0).float()
+                    recon_loss = (position_mse * reward_weights).mean()
+                    
+                    # Update the start index for next compression
+                    self._compressed_start_idx += compress_end
+                else:
+                    recon_loss = position_mse.mean()
+                
                 total_recon_loss = total_recon_loss + recon_loss
             
             latent_tokens = new_latent
@@ -288,8 +312,10 @@ class CompressedAD(nn.Module):
         context, _ = pack([states, actions, rewards, next_states], 'b n *')
         context_embed = self.embed_context(context)
 
-        # Forward with compression if needed
-        transformer_output, compression_info = self._forward_with_compression(context_embed, query_states_embed)
+        # Forward with compression if needed (pass rewards for weighted reconstruction)
+        transformer_output, compression_info = self._forward_with_compression(
+            context_embed, query_states_embed, rewards=rewards
+        )
 
         result = {}
 

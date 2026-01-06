@@ -95,7 +95,9 @@ class CompressedADDataset(Dataset):
     - Medium sequences (1 compression)
     - Long sequences (2-3 compressions)
     - Very long sequences (4+ compressions)
-    - Extended sequences (6+ compressions) for robust multi-compression learning
+    
+    Supports curriculum-aware sampling where length distribution can be 
+    dynamically updated during training to prevent catastrophic forgetting.
     """
     
     def __init__(self, config, traj_dir, mode='train', n_stream=None, source_timesteps=None):
@@ -109,18 +111,17 @@ class CompressedADDataset(Dataset):
         self.min_context = config.get('min_context_length', 50)
         self.max_context = config.get('max_context_length', 800)
         
-        # Length distribution (can be configured) - supports extended distribution
+        # Length distribution (can be updated dynamically for curriculum)
         default_distribution = {
             'short': 0.2,      # No compression: 50-200
             'medium': 0.3,     # 1 compression: 250-400  
             'long': 0.3,       # 2-3 compressions: 450-700
             'very_long': 0.2,  # 4+ compressions: 750-1000
         }
-        self.length_distribution = config.get('length_distribution', default_distribution)
+        self.length_distribution = config.get('length_distribution', default_distribution).copy()
         
         # Validate distribution sums to 1.0
-        total_prob = sum(self.length_distribution.values())
-        assert abs(total_prob - 1.0) < 1e-6, f"Length distribution must sum to 1.0, got {total_prob}"
+        self._validate_distribution(self.length_distribution)
         
         if self.env == 'darkroom':
             n_total_envs = config['grid_size'] ** 2
@@ -161,6 +162,25 @@ class CompressedADDataset(Dataset):
         
         self.seq_length = self.states.shape[1]
         self.n_histories = self.states.shape[0]
+    
+    def _validate_distribution(self, dist):
+        """Validate that distribution sums to 1.0."""
+        total_prob = sum(dist.values())
+        assert abs(total_prob - 1.0) < 1e-6, f"Length distribution must sum to 1.0, got {total_prob}"
+    
+    def update_length_distribution(self, new_distribution):
+        """
+        Update the length distribution for curriculum-aware sampling.
+        
+        This allows the training script to dynamically change what sequence
+        lengths are sampled based on the current curriculum stage.
+        
+        Args:
+            new_distribution: dict with keys like 'short', 'medium', 'long', 'very_long'
+                             and values summing to 1.0
+        """
+        self._validate_distribution(new_distribution)
+        self.length_distribution = new_distribution.copy()
     
     def __len__(self):
         # Approximate: we can sample many different windows

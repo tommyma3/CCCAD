@@ -2,26 +2,26 @@ include: config/model/ad_base.yaml
 
 model: CompressedAD
 
-# AD Transformer
-tf_n_embd: 64
-tf_n_layer: 4
-tf_n_head: 4
+# AD Transformer - increased capacity
+tf_n_embd: 128         # Increased from 64 for more capacity
+tf_n_layer: 6          # Increased from 4
+tf_n_head: 8           # Increased from 4
 tf_dropout: 0.1
 tf_attn_dropout: 0.1
-tf_n_inner: 128
+tf_n_inner: 256        # 2x embedding dim
 n_transit: 240  
 
-# Compression Settings
+# Compression Settings - improved
 n_compress_tokens: 64   
-compress_n_layers: 3    
+compress_n_layers: 4    # Increased from 3 for better compression
 compress_n_heads: 8     
 
 # Gradient control
 max_gradient_rounds: 2
 
-# Reconstruction regularization during fine-tuning
+# Reconstruction regularization - increased weight to preserve information
 use_recon_reg: True
-recon_reg_weight: 0.1
+recon_reg_weight: 0.3   # Increased from 0.1 to better preserve goal info
 
 # Curriculum settings (None = unlimited)
 max_compressions: null
@@ -30,31 +30,52 @@ max_compressions: null
 min_context_length: 50
 max_context_length: 1000
 
-# Balanced length distribution for 1040-step dataset
-# Emphasize short/medium to ensure solid AD learning first
-length_distribution:
-  short: 0.30      # No compression: 50-200 (most important for base learning)
-  medium: 0.30     # 1 compression: 250-400 
-  long: 0.25       # 2-3 compressions: 450-700
-  very_long: 0.15  # 3-4 compressions: 750-1000
-
-# Training
-lr: 0.0003  
-train_batch_size: 64  # Reduced to avoid OOM with variable-length sequences
-test_batch_size: 128
-train_source_timesteps: 1000  # Match available data
-train_timesteps: 100000
-num_warmup_steps: 1000  
-
-num_workers: 4
-
-# Curriculum - gradual progression
+# Curriculum with stage-specific length distributions
+# Each stage specifies max compressions AND what sequence lengths to sample
+# This prevents catastrophic forgetting by:
+#   1. Only sampling sequences the model can handle at each stage
+#   2. Always including short sequences to maintain base AD skills
+#   3. Gradually introducing longer sequences as capacity increases
 curriculum_schedule:
   - step: 0
     max_compressions: 1
-  - step: 15000
+    # Focus on short/medium - learn basic AD and single compression
+    length_distribution:
+      short: 0.50       # No compression: 50-200
+      medium: 0.45      # 1 compression: 250-400
+      long: 0.05        # Minimal long (will be truncated anyway)
+      very_long: 0.00   # None
+  - step: 25000
     max_compressions: 2
-  - step: 35000
-    max_compressions: 3
+    # Introduce more medium, start some long sequences
+    length_distribution:
+      short: 0.35       # Maintain base AD skills
+      medium: 0.40      # Still important for 1-compression
+      long: 0.20        # Now can handle 2 compressions
+      very_long: 0.05   # Small amount
   - step: 60000
+    max_compressions: 3
+    # Balanced distribution, still maintain short
+    length_distribution:
+      short: 0.25       # Always maintain some short
+      medium: 0.30      
+      long: 0.30        # Full 2-3 compression training
+      very_long: 0.15   # More very long
+  - step: 100000
     max_compressions: null  # Unlimited
+    # Final distribution - all lengths
+    length_distribution:
+      short: 0.20       # Still maintain short for stability
+      medium: 0.25
+      long: 0.30
+      very_long: 0.25   # Maximum very long exposure
+
+# Training - adjusted for larger model
+lr: 0.0001          # Lower LR for larger model
+train_batch_size: 64  # Reduced for larger model
+test_batch_size: 128
+train_source_timesteps: 1000  # Match available data
+train_timesteps: 150000       # Increased from 100k for larger model
+num_warmup_steps: 2000        # More warmup for stability
+
+num_workers: 4
