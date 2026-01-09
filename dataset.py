@@ -198,20 +198,20 @@ class CompressedADDataset(Dataset):
             cumulative += prob
             if r < cumulative:
                 if category == 'short':
-                    # No compression needed
-                    low, high = 50, min(200, self.n_transit - 1)
+                    # No compression needed (fits in n_transit)
+                    low, high = 20, min(self.n_transit - 1, 50)
                 elif category == 'medium':
-                    # ~1 compression
-                    low, high = 250, 400
+                    # 1-2 compressions
+                    low, high = self.n_transit, min(150, self.max_context)
                 elif category == 'long':
-                    # 2-3 compressions
-                    low, high = 450, 700
+                    # 3-8 compressions
+                    low, high = 200, min(400, self.max_context)
                 elif category == 'very_long':
-                    # 3-4 compressions
-                    low, high = 750, self.max_context
+                    # 10+ compressions
+                    low, high = 500, self.max_context
                 elif category == 'extended':
-                    # 5+ compressions (requires longer dataset)
-                    low, high = 1100, self.max_context
+                    # Maximum compressions (requires longer dataset)
+                    low, high = 800, self.max_context
                 else:
                     # Fallback for unknown categories
                     low, high = self.min_context, self.max_context
