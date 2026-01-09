@@ -17,9 +17,9 @@ compress_n_layers: 3    # Match cad_dr.yaml
 compress_n_heads: 4     # Match cad_dr.yaml
 
 # Pre-training specific
-pretrain_timesteps: 20000   # Smaller model needs less pretraining
+pretrain_timesteps: 30000   # Smaller model needs less pretraining
 pretrain_batch_size: 512    # Larger batch for smaller model
-pretrain_lr: 0.0005
+pretrain_lr: 0.0003
 pretrain_warmup_steps: 1000
 
 # Dataset

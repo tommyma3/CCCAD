@@ -34,7 +34,7 @@ from torch.utils.tensorboard import SummaryWriter
 from dataset import CompressedADDataset, ADDataset
 from env import SAMPLE_ENVIRONMENT
 from model import MODEL
-from utils import get_config, next_dataloader
+from utils import get_config, next_dataloader, get_curriculum_aware_scheduler
 from transformers import get_cosine_schedule_with_warmup
 
 import multiprocessing
@@ -326,11 +326,26 @@ if __name__ == '__main__':
         weight_decay=config['weight_decay']
     )
     
-    lr_sched = get_cosine_schedule_with_warmup(
-        optimizer, 
-        config['num_warmup_steps'], 
-        config['train_timesteps']
-    )
+    # Use curriculum-aware scheduler if curriculum is enabled, otherwise use standard cosine
+    if use_curriculum:
+        lr_sched = get_curriculum_aware_scheduler(
+            optimizer=optimizer,
+            curriculum=curriculum,
+            total_steps=config['train_timesteps'],
+            initial_warmup_steps=config.get('num_warmup_steps', 1000),
+            stage_warmup_steps=config.get('stage_warmup_steps', 500),
+            min_lr_ratio=config.get('min_lr_ratio', 0.1),
+        )
+        if is_main:
+            print(f'Using curriculum-aware LR scheduler with stage warmups')
+    else:
+        lr_sched = get_cosine_schedule_with_warmup(
+            optimizer, 
+            config['num_warmup_steps'], 
+            config['train_timesteps']
+        )
+        if is_main:
+            print(f'Using standard cosine LR scheduler')
     
     step = 0
 

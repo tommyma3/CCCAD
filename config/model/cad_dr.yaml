@@ -45,11 +45,11 @@ curriculum_schedule:
     max_compressions: 1
     # Focus on short/medium - learn basic AD and single compression
     length_distribution:
-      short: 0.50       # No compression: 20-50
-      medium: 0.45      # 1-2 compressions: 60-150
+      short: 0.60       # No compression: 20-50
+      medium: 0.35      # 1-2 compressions: 60-150
       long: 0.05        # Minimal long
       very_long: 0.00   # None
-  - step: 25000
+  - step: 30000
     max_compressions: 3
     # More compressions allowed
     length_distribution:
@@ -81,5 +81,9 @@ test_batch_size: 256
 train_source_timesteps: 1000
 train_timesteps: 100000
 num_warmup_steps: 1000
+
+# Curriculum-aware LR scheduler settings
+stage_warmup_steps: 500   # Warmup steps at each curriculum stage transition
+min_lr_ratio: 0.1         # Minimum LR as ratio of base LR (10% of base)
 
 num_workers: 4
