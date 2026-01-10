@@ -34,18 +34,29 @@ if __name__ == '__main__':
                        help='Directory containing CAD checkpoint')
     parser.add_argument('--eval_episodes', type=int, default=500,
                        help='Number of episodes to evaluate')
+    parser.add_argument('--use_best', action='store_true',
+                       help='Use best-model.pt instead of latest checkpoint')
     args = parser.parse_args()
     
     ckpt_dir = args.ckpt_dir
-    ckpt_paths = sorted(glob(path.join(ckpt_dir, 'ckpt-*.pt')))
-
-    if len(ckpt_paths) > 0:
-        ckpt_path = ckpt_paths[-1]
-        ckpt = torch.load(ckpt_path, map_location=device)
-        print(f'Checkpoint loaded from {ckpt_path}')
+    
+    # Check for best model first if requested
+    best_model_path = path.join(ckpt_dir, 'best-model.pt')
+    if args.use_best and path.exists(best_model_path):
+        ckpt_path = best_model_path
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        print(f'Best model loaded from {ckpt_path}')
+        print(f'Best model was saved at step {ckpt["step"]} with reward {ckpt.get("eval_reward", "N/A")}')
         config = ckpt['config']
     else:
-        raise ValueError('No checkpoint found.')
+        ckpt_paths = sorted(glob(path.join(ckpt_dir, 'ckpt-*.pt')))
+        if len(ckpt_paths) > 0:
+            ckpt_path = ckpt_paths[-1]
+            ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+            print(f'Checkpoint loaded from {ckpt_path}')
+            config = ckpt['config']
+        else:
+            raise ValueError('No checkpoint found.')
     
     config['device'] = device
     

@@ -387,6 +387,13 @@ if __name__ == '__main__':
     
     # Track current curriculum stage for length distribution updates
     current_curriculum_stage = -1
+    
+    # Best model tracking for early stopping / model selection
+    best_eval_reward = -float('inf')
+    best_step = 0
+    patience_counter = 0
+    patience = config.get('early_stopping_patience', 5)  # Number of eval intervals without improvement
+    save_best_model = config.get('save_best_model', True)
 
     # Training loop
     with tqdm(total=config['train_timesteps'], position=0, leave=True, disable=not is_main) as pbar:
@@ -509,10 +516,37 @@ if __name__ == '__main__':
                     mean_reward = eval_output['reward_episode'].mean()
                     total_compressions = eval_output['total_compressions']
                     
+                    # Per-environment rewards for detailed tracking
+                    env_rewards = eval_output['reward_episode'].mean(axis=1)
+                    
                     writer.add_scalar('eval/mean_reward', mean_reward, step)
                     writer.add_scalar('eval/total_compressions', total_compressions, step)
+                    for env_idx, env_reward in enumerate(env_rewards):
+                        writer.add_scalar(f'eval/env_{env_idx}_reward', env_reward, step)
                     
                     print(f'\nIn-context eval: mean_reward={mean_reward:.3f}, compressions={total_compressions}')
+                    print(f'Per-env rewards: {env_rewards}')
+                    
+                    # Best model tracking
+                    if save_best_model and mean_reward > best_eval_reward:
+                        best_eval_reward = mean_reward
+                        best_step = step
+                        patience_counter = 0
+                        
+                        # Save best model
+                        best_ckpt_path = path.join(config['log_dir'], 'best-model.pt')
+                        torch.save({
+                            'step': step,
+                            'config': config,
+                            'model': unwrapped.state_dict(),
+                            'optimizer': optimizer.state_dict(),
+                            'lr_sched': lr_sched.state_dict(),
+                            'eval_reward': mean_reward,
+                        }, best_ckpt_path)
+                        print(f'New best model saved! reward={mean_reward:.3f} at step {step}')
+                    else:
+                        patience_counter += 1
+                        print(f'No improvement. Best: {best_eval_reward:.3f} at step {best_step} (patience: {patience_counter}/{patience})')
                     
                     del eval_output
                 

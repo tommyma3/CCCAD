@@ -40,6 +40,7 @@ min_context_length: 20
 max_context_length: 1000
 
 # Curriculum with stage-specific length distributions
+# NOTE: Final stage should start well before train_timesteps to allow learning!
 curriculum_schedule:
   - step: 0
     max_compressions: 1
@@ -57,7 +58,7 @@ curriculum_schedule:
       medium: 0.40
       long: 0.20        # 3-8 compressions: 200-400
       very_long: 0.05
-  - step: 60000
+  - step: 50000
     max_compressions: 6
     # Balanced distribution
     length_distribution:
@@ -65,14 +66,14 @@ curriculum_schedule:
       medium: 0.30
       long: 0.30
       very_long: 0.15
-  - step: 100000
-    max_compressions: null  # Unlimited
-    # Final distribution - all lengths
+  - step: 75000
+    max_compressions: null  # Unlimited - start 25k steps before end!
+    # Final distribution - maintain mix to prevent forgetting
     length_distribution:
-      short: 0.20
+      short: 0.25           # Keep short sequences to prevent forgetting!
       medium: 0.25
-      long: 0.30
-      very_long: 0.25   # 10+ compressions: 500-1000
+      long: 0.25
+      very_long: 0.25       # 10+ compressions: 500-1000
 
 # Training
 lr: 0.0003          # Can use higher LR for smaller model
@@ -85,5 +86,9 @@ num_warmup_steps: 1000
 # Curriculum-aware LR scheduler settings
 stage_warmup_steps: 500   # Warmup steps at each curriculum stage transition
 min_lr_ratio: 0.1         # Minimum LR as ratio of base LR (10% of base)
+
+# Best model tracking
+save_best_model: True
+early_stopping_patience: 10  # Number of gen_intervals without improvement before warning
 
 num_workers: 4
