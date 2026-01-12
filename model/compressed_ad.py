@@ -7,8 +7,12 @@ This model extends the original AD with a compression mechanism:
 3. Repeat compression as needed for very long sequences
 
 Uses GPT-2 style Pre-LayerNorm transformer architecture.
+
+Supports optional target network for compression transformer (DQN-style) to address
+the moving target problem when training with multiple compressions.
 """
 
+import copy
 import numpy as np
 import torch
 import torch.nn as nn
@@ -45,6 +49,12 @@ class CompressedAD(nn.Module):
         self.use_recon_reg = config.get('use_recon_reg', True)
         self.recon_reg_weight = config.get('recon_reg_weight', 0.1)
         
+        # Target network settings (DQN-style for stable compression targets)
+        self.use_target_compression = config.get('use_target_compression', False)
+        self.target_update_interval = config.get('target_update_interval', 1000)
+        self.target_soft_update = config.get('target_soft_update', False)
+        self.target_tau = config.get('target_tau', 0.005)  # For soft updates
+        
         # Curriculum settings
         self.max_compressions = config.get('max_compressions', None)  # None = unlimited
         
@@ -80,6 +90,25 @@ class CompressedAD(nn.Module):
             dim_feedforward=tf_dim_feedforward,
         )
         
+        # Target Compression Transformer (for stable targets during training)
+        # Only used when use_target_compression=True
+        if self.use_target_compression:
+            self.target_compression_transformer = CompressionTransformer(
+                d_model=tf_n_embd,
+                n_heads=self.compress_n_heads,
+                n_layers=self.compress_n_layers,
+                n_compress_tokens=self.n_compress_tokens,
+                dim_feedforward=tf_dim_feedforward,
+            )
+            # Initialize target with same weights as policy network
+            self.target_compression_transformer.load_state_dict(
+                self.compression_transformer.state_dict()
+            )
+            # Freeze target network - it's only updated via sync
+            for param in self.target_compression_transformer.parameters():
+                param.requires_grad = False
+            self._compression_update_counter = 0
+        
         # Reconstruction Decoder (for pre-training and optional regularization)
         self.reconstruction_decoder = ReconstructionDecoder(
             d_model=tf_n_embd,
@@ -96,6 +125,55 @@ class CompressedAD(nn.Module):
 
         # Initialize weights
         nn.init.trunc_normal_(self.latent_type_embedding, std=0.02)
+
+    def sync_target_compression(self, soft=None):
+        """
+        Synchronize target compression transformer with policy compression transformer.
+        
+        Args:
+            soft: If True, use soft update (exponential moving average).
+                  If False, use hard update (direct copy).
+                  If None, use the config setting.
+        """
+        if not self.use_target_compression:
+            return
+            
+        soft = soft if soft is not None else self.target_soft_update
+        
+        if soft:
+            # Soft update: target = tau * policy + (1 - tau) * target
+            for target_param, policy_param in zip(
+                self.target_compression_transformer.parameters(),
+                self.compression_transformer.parameters()
+            ):
+                target_param.data.copy_(
+                    self.target_tau * policy_param.data + 
+                    (1 - self.target_tau) * target_param.data
+                )
+        else:
+            # Hard update: direct copy
+            self.target_compression_transformer.load_state_dict(
+                self.compression_transformer.state_dict()
+            )
+    
+    def maybe_sync_target_compression(self):
+        """
+        Check if it's time to sync target network and do so if needed.
+        Call this after each training step.
+        
+        Returns:
+            bool: True if sync was performed, False otherwise.
+        """
+        if not self.use_target_compression:
+            return False
+            
+        self._compression_update_counter += 1
+        
+        if self._compression_update_counter >= self.target_update_interval:
+            self.sync_target_compression()
+            self._compression_update_counter = 0
+            return True
+        return False
 
     def _get_attention_mask_for_latent(self, seq_len):
         """
@@ -155,6 +233,10 @@ class CompressedAD(nn.Module):
         """
         Compress a sequence using the compression transformer.
         
+        When use_target_compression is enabled:
+        - Uses TARGET network to generate latent tokens for AD (stable targets)
+        - Uses POLICY network for gradient flow to update compression transformer
+        
         Args:
             context_embed: (batch, seq_len, d_model) - embedded transitions
             compression_round: int - which compression round (for gradient truncation)
@@ -162,11 +244,30 @@ class CompressedAD(nn.Module):
         Returns:
             latent_tokens: (batch, n_compress_tokens, d_model)
         """
-        latent_tokens = self.compression_transformer(context_embed)
-        
         # Gradient truncation after max_gradient_rounds
-        if compression_round >= self.max_gradient_rounds:
-            latent_tokens = latent_tokens.detach()
+        should_detach = compression_round >= self.max_gradient_rounds
+        
+        if self.use_target_compression and self.training:
+            # Use target network for stable latent representations
+            with torch.no_grad():
+                latent_tokens = self.target_compression_transformer(context_embed)
+            
+            # If we still want gradients for reconstruction regularization,
+            # also compute through policy network (but don't use for AD input)
+            if not should_detach and self.use_recon_reg:
+                # This path is only for reconstruction loss gradient
+                policy_latent = self.compression_transformer(context_embed)
+                # Store for reconstruction loss computation
+                self._policy_latent_for_recon = policy_latent
+            else:
+                self._policy_latent_for_recon = None
+        else:
+            # Original behavior: use policy network directly
+            latent_tokens = self.compression_transformer(context_embed)
+            self._policy_latent_for_recon = None
+            
+            if should_detach:
+                latent_tokens = latent_tokens.detach()
             
         return latent_tokens
 
@@ -254,7 +355,14 @@ class CompressedAD(nn.Module):
             # Optional: compute reward-weighted reconstruction loss for regularization
             # This gives higher weight to transitions with positive rewards (goal-finding)
             if self.training and self.use_recon_reg:
-                reconstructed = self.reconstruction_decoder(new_latent, compress_input.shape[1])
+                # When using target network, use policy latent for reconstruction gradient
+                # Otherwise, use the same latent tokens
+                if self.use_target_compression and self._policy_latent_for_recon is not None:
+                    recon_latent = self._policy_latent_for_recon
+                else:
+                    recon_latent = new_latent
+                    
+                reconstructed = self.reconstruction_decoder(recon_latent, compress_input.shape[1])
                 
                 # Compute per-position MSE
                 position_mse = ((reconstructed - compress_input.detach()) ** 2).mean(dim=-1)  # (batch, seq_len)
@@ -517,6 +625,12 @@ class CompressedAD(nn.Module):
                 'weight': checkpoint['model']['embed_context.weight'],
                 'bias': checkpoint['model']['embed_context.bias']
             })
+        
+        # Sync target compression network if using target network
+        if self.use_target_compression:
+            self.sync_target_compression(soft=False)  # Hard sync
+            self._compression_update_counter = 0
+            print("  Target compression network synced with pretrained weights")
             
         print(f"Loaded pre-trained compression from {pretrain_checkpoint_path}")
 
