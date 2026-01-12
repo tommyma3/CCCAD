@@ -41,9 +41,15 @@ class CompressedAD(nn.Module):
         self.n_compress_tokens = config.get('n_compress_tokens', 40)
         self.compress_n_layers = config.get('compress_n_layers', 2)
         self.compress_n_heads = config.get('compress_n_heads', 4)
-        self.max_gradient_rounds = config.get('max_gradient_rounds', 2)
         self.use_recon_reg = config.get('use_recon_reg', True)
         self.recon_reg_weight = config.get('recon_reg_weight', 0.1)
+        
+        # Gradient scaling config
+        # Instead of hard cutoff, use exponential decay: scale = decay_factor ^ round
+        # Set decay_factor=0.0 to disable (hard cutoff at round 0)
+        # Set decay_factor=1.0 for full gradients through all rounds
+        self.gradient_decay_factor = config.get('gradient_decay_factor', 0.5)
+        self.min_gradient_scale = config.get('min_gradient_scale', 0.01)  # Floor to prevent vanishing
         
         # Curriculum settings
         self.max_compressions = config.get('max_compressions', None)  # None = unlimited
@@ -151,22 +157,55 @@ class CompressedAD(nn.Module):
         
         return output
 
+    @staticmethod
+    def _scale_gradient(x, scale):
+        """
+        Scale gradients without changing forward pass values.
+        
+        Forward: returns x unchanged
+        Backward: gradient is multiplied by scale
+        
+        Args:
+            x: tensor to scale gradients for
+            scale: gradient scaling factor (0 to 1)
+            
+        Returns:
+            tensor with same values but scaled gradients
+        """
+        if scale >= 1.0:
+            return x
+        if scale <= 0.0:
+            return x.detach()
+        # x * scale + x.detach() * (1 - scale)
+        # Forward: x * scale + x * (1 - scale) = x
+        # Backward: only x * scale has gradient, so grad is scaled by `scale`
+        return x * scale + x.detach() * (1.0 - scale)
+
     def _compress_sequence(self, context_embed, compression_round):
         """
         Compress a sequence using the compression transformer.
         
+        Uses gradient scaling: gradients decay exponentially with compression round.
+        scale = decay_factor ^ compression_round
+        
         Args:
             context_embed: (batch, seq_len, d_model) - embedded transitions
-            compression_round: int - which compression round (for gradient truncation)
+            compression_round: int - which compression round (for gradient scaling)
             
         Returns:
             latent_tokens: (batch, n_compress_tokens, d_model)
         """
         latent_tokens = self.compression_transformer(context_embed)
         
-        # Gradient truncation after max_gradient_rounds
-        if compression_round >= self.max_gradient_rounds:
-            latent_tokens = latent_tokens.detach()
+        # Gradient scaling: exponential decay based on compression round
+        # Round 0: scale = 1.0, Round 1: scale = decay, Round 2: scale = decay^2, ...
+        gradient_scale = self.gradient_decay_factor ** compression_round
+        
+        # Apply floor to prevent completely vanishing gradients
+        gradient_scale = max(gradient_scale, self.min_gradient_scale)
+        
+        # Apply gradient scaling
+        latent_tokens = self._scale_gradient(latent_tokens, gradient_scale)
             
         return latent_tokens
 

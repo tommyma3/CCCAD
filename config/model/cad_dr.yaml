@@ -19,8 +19,11 @@ n_compress_tokens: 16   # Reduced from 64 - more aggressive compression
 compress_n_layers: 3
 compress_n_heads: 4
 
-# Gradient control
-max_gradient_rounds: 2
+# Gradient scaling for multi-round compression
+# Gradients decay exponentially: scale = decay_factor ^ compression_round
+# Round 0: 100%, Round 1: 50%, Round 2: 25%, Round 3: 12.5%, ...
+gradient_decay_factor: 0.6   # Set to 0.0 for hard cutoff, 1.0 for full gradients
+min_gradient_scale: 0.01     # Floor to prevent completely vanishing gradients
 
 
 # Reconstruction regularization
