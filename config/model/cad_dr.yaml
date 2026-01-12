@@ -22,13 +22,6 @@ compress_n_heads: 4
 # Gradient control
 max_gradient_rounds: 2
 
-# Target compression network (DQN-style) - addresses moving target problem
-# When enabled, uses a separate target network for generating stable latent representations
-# while the policy network is being trained. Target is synced periodically.
-use_target_compression: True        # Enable target network for compression
-target_update_interval: 1000        # Sync target every N training steps
-target_soft_update: True           # False = hard update (copy), True = soft update (EMA)
-target_tau: 0.005                   # EMA coefficient if soft_update is True
 
 # Reconstruction regularization
 use_recon_reg: True

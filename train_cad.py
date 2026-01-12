@@ -238,12 +238,6 @@ if __name__ == '__main__':
         print(f'Curriculum schedule: {curriculum}')
         print(f'Max context length: {config.get("max_context_length", 800)}')
         print(f'Train source timesteps: {config.get("train_source_timesteps", 1000)}')
-        print(f'Target compression network: {config.get("use_target_compression", False)}')
-        if config.get('use_target_compression', False):
-            print(f'  - Update interval: {config.get("target_update_interval", 1000)}')
-            print(f'  - Soft update: {config.get("target_soft_update", False)}')
-            if config.get('target_soft_update', False):
-                print(f'  - Tau: {config.get("target_tau", 0.005)}')
         print(f'Train timesteps: {config.get("train_timesteps", 100000)}')
         
         # Save config
@@ -364,14 +358,6 @@ if __name__ == '__main__':
         optimizer.load_state_dict(ckpt['optimizer'])
         lr_sched.load_state_dict(ckpt['lr_sched'])
         step = ckpt['step']
-        
-        # Sync target network after loading checkpoint
-        if config.get('use_target_compression', False):
-            model.sync_target_compression(soft=False)
-            model._compression_update_counter = 0
-            if is_main:
-                print('Target compression network synced after checkpoint load')
-        
         if is_main:
             print(f'Checkpoint loaded from {ckpt_path}')
 
@@ -449,12 +435,6 @@ if __name__ == '__main__':
             accelerator.backward(loss)
             accelerator.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-
-            # Sync target compression network if using target network
-            unwrapped = accelerator.unwrap_model(model)
-            target_synced = unwrapped.maybe_sync_target_compression()
-            if target_synced and is_main:
-                print(f'\n[Step {step}] Target compression network synced')
 
             if not accelerator.optimizer_step_was_skipped:
                 lr_sched.step()
