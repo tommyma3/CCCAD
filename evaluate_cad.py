@@ -32,7 +32,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--ckpt_dir', type=str, default='./runs/CAD-darkroom-seed0',
                        help='Directory containing CAD checkpoint')
-    parser.add_argument('--eval_episodes', type=int, default=500,
+    parser.add_argument('--eval_episodes', type=int, default=100,
                        help='Number of episodes to evaluate')
     parser.add_argument('--use_best', action='store_true',
                        help='Use best-model.pt instead of latest checkpoint')

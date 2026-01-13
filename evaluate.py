@@ -55,7 +55,7 @@ if __name__ == '__main__':
     print(f'Starting at {start_time}')
 
     with torch.no_grad():
-        test_rewards = model.evaluate_in_context(vec_env=envs, eval_timesteps=config['horizon'] * 500)['reward_episode']
+        test_rewards = model.evaluate_in_context(vec_env=envs, eval_timesteps=config['horizon'] * 100)['reward_episode']
         path = path.join(ckpt_dir, 'eval_result.npy')
     
     end_time = datetime.now()
