@@ -27,6 +27,11 @@ max_gradient_rounds: 100
 use_recon_reg: True
 recon_reg_weight: 0.5
 
+# Reward-weighted reconstruction (during fine-tuning)
+# Gives higher weight to transitions with positive rewards (goal-finding)
+use_reward_weighted_recon: True   # Enable/disable reward weighting
+reward_weight_multiplier: 5.0     # Weight for positive reward transitions (1.0 = no extra weight)
+
 # Curriculum settings (None = unlimited)
 max_compressions: null
 

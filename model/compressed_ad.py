@@ -45,6 +45,10 @@ class CompressedAD(nn.Module):
         self.use_recon_reg = config.get('use_recon_reg', True)
         self.recon_reg_weight = config.get('recon_reg_weight', 0.1)
         
+        # Reward-weighted reconstruction config
+        self.use_reward_weighted_recon = config.get('use_reward_weighted_recon', True)
+        self.reward_weight_multiplier = config.get('reward_weight_multiplier', 5.0)  # Weight for positive reward transitions
+        
         # Curriculum settings
         self.max_compressions = config.get('max_compressions', None)  # None = unlimited
         
@@ -259,14 +263,16 @@ class CompressedAD(nn.Module):
                 # Compute per-position MSE
                 position_mse = ((reconstructed - compress_input.detach()) ** 2).mean(dim=-1)  # (batch, seq_len)
                 
-                # Apply reward weighting if rewards are available
-                if self._current_rewards is not None and compression_round == 0:
+                # Apply reward weighting if enabled and rewards are available
+                if (self.use_reward_weighted_recon and 
+                    self._current_rewards is not None and 
+                    compression_round == 0):
                     # Get rewards for the compressed positions
                     compress_rewards = self._current_rewards[:, self._compressed_start_idx:self._compressed_start_idx + compress_end]
                     compress_rewards = compress_rewards.squeeze(-1)  # (batch, seq_len)
                     
-                    # Weight: 1.0 for zero-reward transitions, 5.0 for positive-reward transitions
-                    reward_weights = 1.0 + 4.0 * (compress_rewards > 0).float()
+                    # Weight: 1.0 for zero-reward transitions, reward_weight_multiplier for positive-reward transitions
+                    reward_weights = 1.0 + (self.reward_weight_multiplier - 1.0) * (compress_rewards > 0).float()
                     recon_loss = (position_mse * reward_weights).mean()
                     
                     # Update the start index for next compression
