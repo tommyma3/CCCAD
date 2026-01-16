@@ -10,15 +10,18 @@ from gymnasium.core import ObsType
 
 
 def sample_dark_key_to_door(config, shuffle=True):
-    keys_goals = [np.array([i, j, k, l])
+    keys_goals_all = [np.array([i, j, k, l])
              for i in range(config['grid_size']) for j in range(config['grid_size'])
              for k in range(config['grid_size']) for l in range(config['grid_size'])]
     
     if shuffle:
         random.seed(config['env_split_seed'])
-        random.shuffle(keys_goals)
+        random.shuffle(keys_goals_all)
 
-    n_train_envs = round(config['grid_size'] ** 4 * config['train_env_ratio'])
+    total_tasks = min(200, len(keys_goals_all))
+    keys_goals = keys_goals_all[:total_tasks]
+
+    n_train_envs = round(total_tasks * config['train_env_ratio'])
 
     train_keys_goals = keys_goals[:n_train_envs]
     test_keys_goals = keys_goals[n_train_envs:]
