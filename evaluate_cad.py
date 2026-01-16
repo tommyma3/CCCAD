@@ -75,8 +75,10 @@ if __name__ == '__main__':
 
     if env_name == 'darkroom':
         envs = SubprocVecEnv([make_env(config, goal=arg) for arg in test_env_args])
+    elif env_name == 'dark_key_to_door':
+        envs = SubprocVecEnv([make_env(config, key=arg[:2], goal=arg[2:]) for arg in test_env_args])
     else:
-        raise NotImplementedError(f'Environment not supported')
+        raise NotImplementedError(f'Environment not supported: {env_name}')
     
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)

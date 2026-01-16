@@ -2,8 +2,9 @@ import os
 from datetime import datetime
 import yaml
 import multiprocessing
+import argparse
 
-from env import SAMPLE_ENVIRONMENT, make_env, Darkroom, DarkroomPermuted
+from env import SAMPLE_ENVIRONMENT, make_env, Darkroom, DarkroomPermuted, DarkKeyToDoor
 from algorithm import ALGORITHM, HistoryLoggerCallback
 import h5py
 import numpy as np
@@ -18,8 +19,13 @@ def worker(arg, config, traj_dir, env_idx, history, file_name):
     
     if config['env'] == 'darkroom':
         env = DummyVecEnv([make_env(config, goal=arg)] * config['n_stream'])
+    elif config['env'] == 'dark_key_to_door':
+        # arg is (key_x, key_y, goal_x, goal_y)
+        key = arg[:2]
+        goal = arg[2:]
+        env = DummyVecEnv([make_env(config, key=key, goal=goal)] * config['n_stream'])
     else:
-        raise ValueError('Invalid environment')
+        raise ValueError(f'Invalid environment: {config["env"]}')
     
     alg_name = config['alg']
     seed = config['alg_seed'] + env_idx
@@ -42,8 +48,23 @@ def worker(arg, config, traj_dir, env_idx, history, file_name):
 
 if __name__ == '__main__':
     multiprocessing.set_start_method('spawn')
-    config = get_config("config/env/darkroom.yaml")
-    config.update(get_config("config/algorithm/ppo_darkroom.yaml"))
+    
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--env', type=str, default='darkroom',
+                       help='Environment name: darkroom or dark_key_to_door')
+    args = parser.parse_args()
+    
+    # Determine config files based on environment
+    env_config_map = {
+        'darkroom': ('darkroom', 'ppo_darkroom'),
+        'dark_key_to_door': ('dark_key_to_door', 'ppo_dark_key_to_door'),
+    }
+    if args.env not in env_config_map:
+        raise ValueError(f'Unknown environment: {args.env}')
+    env_cfg, alg_cfg = env_config_map[args.env]
+    
+    config = get_config(f"config/env/{env_cfg}.yaml")
+    config.update(get_config(f"config/algorithm/{alg_cfg}.yaml"))
 
     if not os.path.exists("datasets"):
         os.makedirs("datasets", exist_ok=True)

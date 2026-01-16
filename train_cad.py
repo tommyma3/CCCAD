@@ -184,13 +184,24 @@ if __name__ == '__main__':
                        help='Disable curriculum learning')
     parser.add_argument('--config', type=str, default='cad_dr',
                        help='Model config name (without .yaml extension)')
+    parser.add_argument('--env', type=str, default='darkroom',
+                       help='Environment name: darkroom or dark_key_to_door')
     args = parser.parse_args()
     
     multiprocessing.set_start_method('spawn', force=True)
     
+    # Determine config files based on environment
+    env_config_map = {
+        'darkroom': ('darkroom', 'ppo_darkroom'),
+        'dark_key_to_door': ('dark_key_to_door', 'ppo_dark_key_to_door'),
+    }
+    if args.env not in env_config_map:
+        raise ValueError(f'Unknown environment: {args.env}')
+    env_cfg, alg_cfg = env_config_map[args.env]
+    
     # Load configs
-    config = get_config('./config/env/darkroom.yaml')
-    config.update(get_config('./config/algorithm/ppo_darkroom.yaml'))
+    config = get_config(f'./config/env/{env_cfg}.yaml')
+    config.update(get_config(f'./config/algorithm/{alg_cfg}.yaml'))
     config.update(get_config(f'./config/model/{args.config}.yaml'))
 
     # Set seed for reproducibility
@@ -370,8 +381,10 @@ if __name__ == '__main__':
 
     if env_name == "darkroom":
         envs = SubprocVecEnv([make_env(config, goal=arg) for arg in env_args])
+    elif env_name == "dark_key_to_door":
+        envs = SubprocVecEnv([make_env(config, key=arg[:2], goal=arg[2:]) for arg in env_args])
     else:
-        raise NotImplementedError('Environment not supported')
+        raise NotImplementedError(f'Environment not supported: {env_name}')
 
     # Prepare for distributed training
     model, optimizer, train_dataloader, lr_sched = accelerator.prepare(

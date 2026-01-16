@@ -15,6 +15,7 @@ from datetime import datetime
 import os
 import os.path as path
 from glob import glob
+import argparse
 
 from accelerate import Accelerator
 from accelerate.utils import set_seed
@@ -66,10 +67,26 @@ def get_pretrain_data_loader(dataset, batch_size, config, shuffle=True):
 if __name__ == '__main__':
     multiprocessing.set_start_method('spawn', force=True)
     
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', type=str, default='cad_pretrain',
+                       help='Model config name (without .yaml extension)')
+    parser.add_argument('--env', type=str, default='darkroom',
+                       help='Environment name: darkroom or dark_key_to_door')
+    args = parser.parse_args()
+    
+    # Determine config files based on environment
+    env_config_map = {
+        'darkroom': ('darkroom', 'ppo_darkroom'),
+        'dark_key_to_door': ('dark_key_to_door', 'ppo_dark_key_to_door'),
+    }
+    if args.env not in env_config_map:
+        raise ValueError(f'Unknown environment: {args.env}')
+    env_cfg, alg_cfg = env_config_map[args.env]
+    
     # Load configs
-    config = get_config('./config/env/darkroom.yaml')
-    config.update(get_config('./config/algorithm/ppo_darkroom.yaml'))
-    config.update(get_config('./config/model/cad_pretrain.yaml'))
+    config = get_config(f'./config/env/{env_cfg}.yaml')
+    config.update(get_config(f'./config/algorithm/{alg_cfg}.yaml'))
+    config.update(get_config(f'./config/model/{args.config}.yaml'))
 
     # Set seed for reproducibility
     set_seed(config.get('seed', 42))

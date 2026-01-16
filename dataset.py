@@ -26,8 +26,10 @@ class ADDataset(Dataset):
         
         if self.env == 'darkroom':
             n_total_envs = config['grid_size'] ** 2
+        elif self.env == 'dark_key_to_door':
+            n_total_envs = config['grid_size'] ** 4  # key_x, key_y, goal_x, goal_y
         else:
-            raise ValueError('Invalid env')
+            raise ValueError(f'Invalid env: {self.env}')
 
         total_env_idx = list(range(n_total_envs))
         random.seed(config['env_split_seed'])
@@ -125,8 +127,10 @@ class CompressedADDataset(Dataset):
         
         if self.env == 'darkroom':
             n_total_envs = config['grid_size'] ** 2
+        elif self.env == 'dark_key_to_door':
+            n_total_envs = config['grid_size'] ** 4  # key_x, key_y, goal_x, goal_y
         else:
-            raise ValueError('Invalid environment')
+            raise ValueError(f'Invalid environment: {self.env}')
 
         total_env_idx = list(range(n_total_envs))
         random.seed(config['env_split_seed'])
@@ -278,8 +282,10 @@ class CompressionPretrainDataset(Dataset):
         
         if self.env == 'darkroom':
             n_total_envs = config['grid_size'] ** 2
+        elif self.env == 'dark_key_to_door':
+            n_total_envs = config['grid_size'] ** 4  # key_x, key_y, goal_x, goal_y
         else:
-            raise ValueError('Invalid env')
+            raise ValueError(f'Invalid env: {self.env}')
 
         total_env_idx = list(range(n_total_envs))
         random.seed(config['env_split_seed'])
