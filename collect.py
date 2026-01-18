@@ -81,7 +81,9 @@ if __name__ == '__main__':
         
     traj_dir = 'datasets'
 
-    train_args, test_args = SAMPLE_ENVIRONMENT[config['env']](config, shuffle=False)
+    # Use shuffle=True to ensure diverse train/test split
+    # (tasks are shuffled then split, so both sets have mix of easy/hard tasks)
+    train_args, test_args = SAMPLE_ENVIRONMENT[config['env']](config, shuffle=True)
     total_args = train_args + test_args
     n_envs = len(total_args)
 

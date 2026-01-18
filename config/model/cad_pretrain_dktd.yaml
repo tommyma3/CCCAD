@@ -9,7 +9,7 @@ tf_n_head: 4            # Match cad_dktd.yaml
 tf_dropout: 0.1
 tf_attn_dropout: 0.1
 tf_n_inner: 128         # Match cad_dktd.yaml
-n_transit: 80           # Match cad_dktd.yaml - larger for complex task
+n_transit: 60           # Match cad_dktd.yaml - larger for complex task
 
 # Compression Settings (must match cad_dktd.yaml)
 n_compress_tokens: 16   # Match cad_dktd.yaml - compact latent
@@ -17,7 +17,7 @@ compress_n_layers: 3    # Match cad_dktd.yaml
 compress_n_heads: 4     # Match cad_dktd.yaml
 
 # Pre-training specific
-pretrain_timesteps: 50000   # More pretraining for complex task
+pretrain_timesteps: 20000   # More pretraining for complex task
 pretrain_batch_size: 512
 pretrain_lr: 0.0003
 pretrain_warmup_steps: 1500

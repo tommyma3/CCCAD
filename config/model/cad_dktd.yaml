@@ -12,7 +12,7 @@ tf_n_head: 4
 tf_dropout: 0.1
 tf_attn_dropout: 0.1
 tf_n_inner: 256         # 4x embedding dim
-n_transit: 80           # Larger context for more complex task
+n_transit: 60           # Larger context for more complex task
 
 # Compression Settings
 n_compress_tokens: 20   # More tokens to capture key+door info
@@ -20,16 +20,16 @@ compress_n_layers: 3
 compress_n_heads: 4
 
 # Gradient control
-max_gradient_rounds: 2
+max_gradient_rounds: 99999
 
 # Reconstruction regularization
 use_recon_reg: True
-recon_reg_weight: 0.3
+recon_reg_weight: 0.5
 
 # Reward-weighted reconstruction (during fine-tuning)
 # Gives higher weight to transitions with positive rewards (key-finding and door-reaching)
-use_reward_weighted_recon: True
-reward_weight_multiplier: 5.0
+use_reward_weighted_recon: False
+reward_weight_multiplier: 0.0
 
 # Curriculum settings (None = unlimited)
 max_compressions: null
@@ -48,21 +48,21 @@ curriculum_schedule:
       medium: 0.35
       long: 0.05
       very_long: 0.00
-  - step: 40000
+  - step: 30000
     max_compressions: 3
     length_distribution:
       short: 0.35
       medium: 0.40
       long: 0.20
       very_long: 0.05
-  - step: 80000
+  - step: 60000
     max_compressions: 6
     length_distribution:
       short: 0.25
       medium: 0.30
       long: 0.30
       very_long: 0.15
-  - step: 120000
+  - step: 80000
     max_compressions: null
     length_distribution:
       short: 0.25
@@ -75,7 +75,7 @@ lr: 0.0003
 train_batch_size: 128
 test_batch_size: 256
 train_source_timesteps: 2000
-train_timesteps: 150000
+train_timesteps: 120000
 num_warmup_steps: 2000
 
 # Curriculum-aware LR scheduler settings

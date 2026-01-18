@@ -27,22 +27,20 @@ class ADDataset(Dataset):
         if self.env == 'darkroom':
             n_total_envs = config['grid_size'] ** 2
         elif self.env == 'dark_key_to_door':
-            n_total_envs = config['grid_size'] ** 4  # key_x, key_y, goal_x, goal_y
+            n_total_envs = min(200, config['grid_size'] ** 4)  # Limited to 200 tasks
         else:
             raise ValueError(f'Invalid env: {self.env}')
 
-        total_env_idx = list(range(n_total_envs))
-        random.seed(config['env_split_seed'])
-        random.shuffle(total_env_idx)
-        
+        # Note: collect.py saves data with train tasks first (indices 0 to n_train-1),
+        # then test tasks (indices n_train to n_total-1). No shuffle needed here.
         n_train_envs = round(n_total_envs * config['train_env_ratio'])
         
         if mode == 'train':
-            env_idx = total_env_idx[:n_train_envs]
+            env_idx = list(range(n_train_envs))
         elif mode == 'test':
-            env_idx = total_env_idx[n_train_envs:]
+            env_idx = list(range(n_train_envs, n_total_envs))
         elif mode == 'all':
-            env_idx = total_env_idx
+            env_idx = list(range(n_total_envs))
         else:
             raise ValueError('Invalid mode')
 
@@ -53,11 +51,19 @@ class ADDataset(Dataset):
 
         with h5py.File(f'{traj_dir}/{get_traj_file_name(config)}.hdf5', 'r') as f:
             for i in env_idx:
-                states.append(f[f'{i}']['states'][()].transpose(1, 0, 2)[:n_stream, :source_timesteps])
-                actions.append(f[f'{i}']['actions'][()].transpose(1, 0)[:n_stream, :source_timesteps])
-                rewards.append(f[f'{i}']['rewards'][()].transpose(1, 0)[:n_stream, :source_timesteps])
-                next_states.append(f[f'{i}']['next_states'][()].transpose(1, 0, 2)[:n_stream, :source_timesteps])
+                grp = f.get(f'{i}')
+                if grp is None:
+                    print(f'Warning: trajectory group "{i}" not found in {traj_dir}/{get_traj_file_name(config)}.hdf5; skipping')
+                    continue
+
+                states.append(grp['states'][()].transpose(1, 0, 2)[:n_stream, :source_timesteps])
+                actions.append(grp['actions'][()].transpose(1, 0)[:n_stream, :source_timesteps])
+                rewards.append(grp['rewards'][()].transpose(1, 0)[:n_stream, :source_timesteps])
+                next_states.append(grp['next_states'][()].transpose(1, 0, 2)[:n_stream, :source_timesteps])
                     
+        if len(states) == 0:
+            raise RuntimeError(f'No trajectory groups found for mode="{mode}" in {traj_dir}/{get_traj_file_name(config)}.hdf5')
+
         self.states = np.concatenate(states, axis=0)
         self.actions = np.concatenate(actions, axis=0)
         self.rewards = np.concatenate(rewards, axis=0)
@@ -128,22 +134,20 @@ class CompressedADDataset(Dataset):
         if self.env == 'darkroom':
             n_total_envs = config['grid_size'] ** 2
         elif self.env == 'dark_key_to_door':
-            n_total_envs = config['grid_size'] ** 4  # key_x, key_y, goal_x, goal_y
+            n_total_envs = config['grid_size'] ** 4  # All possible key/goal combinations
         else:
             raise ValueError(f'Invalid environment: {self.env}')
 
-        total_env_idx = list(range(n_total_envs))
-        random.seed(config['env_split_seed'])
-        random.shuffle(total_env_idx)
-        
+        # Note: collect.py saves data with train tasks first (indices 0 to n_train-1),
+        # then test tasks (indices n_train to n_total-1). No shuffle needed here.
         n_train_envs = round(n_total_envs * config['train_env_ratio'])
         
         if mode == 'train':
-            env_idx = total_env_idx[:n_train_envs]
+            env_idx = list(range(n_train_envs))
         elif mode == 'test':
-            env_idx = total_env_idx[n_train_envs:]
+            env_idx = list(range(n_train_envs, n_total_envs))
         elif mode == 'all':
-            env_idx = total_env_idx
+            env_idx = list(range(n_total_envs))
         else:
             raise ValueError('Invalid mode')
 
@@ -154,11 +158,19 @@ class CompressedADDataset(Dataset):
 
         with h5py.File(f'{traj_dir}/{get_traj_file_name(config)}.hdf5', 'r') as f:
             for i in env_idx:
-                states.append(f[f'{i}']['states'][()].transpose(1, 0, 2)[:n_stream, :source_timesteps])
-                actions.append(f[f'{i}']['actions'][()].transpose(1, 0)[:n_stream, :source_timesteps])
-                rewards.append(f[f'{i}']['rewards'][()].transpose(1, 0)[:n_stream, :source_timesteps])
-                next_states.append(f[f'{i}']['next_states'][()].transpose(1, 0, 2)[:n_stream, :source_timesteps])
+                grp = f.get(f'{i}')
+                if grp is None:
+                    print(f'Warning: trajectory group "{i}" not found in {traj_dir}/{get_traj_file_name(config)}.hdf5; skipping')
+                    continue
+
+                states.append(grp['states'][()].transpose(1, 0, 2)[:n_stream, :source_timesteps])
+                actions.append(grp['actions'][()].transpose(1, 0)[:n_stream, :source_timesteps])
+                rewards.append(grp['rewards'][()].transpose(1, 0)[:n_stream, :source_timesteps])
+                next_states.append(grp['next_states'][()].transpose(1, 0, 2)[:n_stream, :source_timesteps])
                     
+        if len(states) == 0:
+            raise RuntimeError(f'No trajectory groups found for mode="{mode}" in {traj_dir}/{get_traj_file_name(config)}.hdf5')
+
         self.states = np.concatenate(states, axis=0)
         self.actions = np.concatenate(actions, axis=0)
         self.rewards = np.concatenate(rewards, axis=0)
@@ -283,22 +295,20 @@ class CompressionPretrainDataset(Dataset):
         if self.env == 'darkroom':
             n_total_envs = config['grid_size'] ** 2
         elif self.env == 'dark_key_to_door':
-            n_total_envs = config['grid_size'] ** 4  # key_x, key_y, goal_x, goal_y
+            n_total_envs = config['grid_size'] ** 4  # All possible key/goal combinations
         else:
             raise ValueError(f'Invalid env: {self.env}')
 
-        total_env_idx = list(range(n_total_envs))
-        random.seed(config['env_split_seed'])
-        random.shuffle(total_env_idx)
-        
+        # Note: collect.py saves data with train tasks first (indices 0 to n_train-1),
+        # then test tasks (indices n_train to n_total-1). No shuffle needed here.
         n_train_envs = round(n_total_envs * config['train_env_ratio'])
         
         if mode == 'train':
-            env_idx = total_env_idx[:n_train_envs]
+            env_idx = list(range(n_train_envs))
         elif mode == 'test':
-            env_idx = total_env_idx[n_train_envs:]
+            env_idx = list(range(n_train_envs, n_total_envs))
         elif mode == 'all':
-            env_idx = total_env_idx
+            env_idx = list(range(n_total_envs))
         else:
             raise ValueError('Invalid mode')
 

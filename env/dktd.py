@@ -18,13 +18,12 @@ def sample_dark_key_to_door(config, shuffle=True):
         random.seed(config['env_split_seed'])
         random.shuffle(keys_goals_all)
 
-    total_tasks = min(200, len(keys_goals_all))
-    keys_goals = keys_goals_all[:total_tasks]
+    total_tasks = len(keys_goals_all)  # Use all possible tasks (grid_size^4)
 
     n_train_envs = round(total_tasks * config['train_env_ratio'])
 
-    train_keys_goals = keys_goals[:n_train_envs]
-    test_keys_goals = keys_goals[n_train_envs:]
+    train_keys_goals = keys_goals_all[:n_train_envs]
+    test_keys_goals = keys_goals_all[n_train_envs:]
 
     return train_keys_goals, test_keys_goals
 
