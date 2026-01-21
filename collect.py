@@ -56,7 +56,7 @@ def worker(arg, config, traj_dir, env_idx, history, file_name):
     config['tensorboard_log'] = None
 
     alg = ALGORITHM[alg_name](config, env, seed)
-    callback = HistoryLoggerCallback(config['env'], env_idx, history)
+    callback = HistoryLoggerCallback(config['env'], env_idx, history, n_stack=n_stack)
 
     print(f'Worker {env_idx} starting training on env {arg} with seed {seed}...')
     
