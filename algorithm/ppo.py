@@ -3,7 +3,7 @@ from stable_baselines3 import PPO
 
 
 class PPOWrapper(PPO):
-    def __init__(self, config, env, seed, log_dir):
+    def __init__(self, config, env, seed, log_dir=None):
         policy = config['policy']
         n_steps = config['n_steps']
         batch_size = config['batch_size']
