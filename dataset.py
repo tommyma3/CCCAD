@@ -210,24 +210,34 @@ class CompressedADDataset(Dataset):
         # Maximum available context (leave room for query state)
         max_available = self.seq_length - 1
         
+        # Calculate compression trigger point: when buffer fills up
+        # Available space = n_transit - n_compress_tokens (if has latent) - 1 (query)
+        # First compression triggers at ~(n_transit - 1) transitions
+        compression_trigger = self.n_transit - 1
+        
         for category, prob in self.length_distribution.items():
             cumulative += prob
             if r < cumulative:
                 if category == 'short':
-                    # No compression needed (fits in n_transit)
-                    low, high = 20, min(self.n_transit - 1, 50)
+                    # No compression needed (fits in n_transit - 1)
+                    low = max(20, self.min_context)
+                    high = min(compression_trigger - 10, compression_trigger - 1)  # Stay below compression
                 elif category == 'medium':
-                    # 1-2 compressions
-                    low, high = self.n_transit, min(150, self.max_context)
+                    # 1-2 compressions - spans 1x to 2.5x compression trigger
+                    low = compression_trigger
+                    high = min(int(compression_trigger * 2.5), self.max_context)
                 elif category == 'long':
-                    # 3-8 compressions
-                    low, high = 200, min(400, self.max_context)
+                    # 3-5 compressions - spans 2.5x to 5x compression trigger
+                    low = min(int(compression_trigger * 2.5), self.max_context)
+                    high = min(int(compression_trigger * 5), self.max_context)
                 elif category == 'very_long':
-                    # 10+ compressions
-                    low, high = 500, self.max_context
+                    # 5+ compressions - spans 5x+ compression trigger
+                    low = min(int(compression_trigger * 5), self.max_context)
+                    high = self.max_context
                 elif category == 'extended':
                     # Maximum compressions (requires longer dataset)
-                    low, high = 800, self.max_context
+                    low = min(int(compression_trigger * 8), self.max_context)
+                    high = self.max_context
                 else:
                     # Fallback for unknown categories
                     low, high = self.min_context, self.max_context
@@ -245,18 +255,23 @@ class CompressedADDataset(Dataset):
         # Use index for reproducibility but also allow randomness
         history_idx = i % self.n_histories
         
-        # Sample context length from distribution
-        context_length = self._sample_context_length()
+        # CRITICAL: Sample a random END position within the trajectory
+        # This ensures the model sees the LEARNING PROGRESSION:
+        # - Early positions: agent is still exploring, making mistakes
+        # - Middle positions: agent is improving
+        # - Late positions: agent has learned good policy
+        # Without this, the model only sees expert behavior and can't learn in-context!
         
-        # Sample a valid end position (where we predict action)
+        # We need at least min_context transitions before end_idx
+        min_end = self.min_context
         max_end = self.seq_length - 1
-        min_end = context_length
         
-        if min_end >= max_end:
-            end_idx = max_end
-        else:
-            end_idx = random.randint(min_end, max_end)
+        # Sample random end position
+        end_idx = random.randint(min_end, max_end)
         
+        # Calculate context length (from start to end_idx, exclusive of end_idx which is query)
+        # We return full available context; collate_fn will truncate based on curriculum
+        context_length = min(end_idx, self.max_context)
         start_idx = end_idx - context_length
         
         traj = {
@@ -266,7 +281,6 @@ class CompressedADDataset(Dataset):
             'actions': self.actions[history_idx, start_idx:end_idx],
             'rewards': self.rewards[history_idx, start_idx:end_idx],
             'next_states': self.next_states[history_idx, start_idx:end_idx],
-            'context_length': context_length,  # For logging/debugging
         }
         
         if self.dynamics:

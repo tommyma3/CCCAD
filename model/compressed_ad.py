@@ -104,8 +104,12 @@ class CompressedAD(nn.Module):
     def _get_attention_mask_for_latent(self, seq_len):
         """
         Generate attention mask for sequences with latent prefix.
-        All tokens can attend to latent tokens (first n_compress_tokens),
-        but recent tokens use causal masking among themselves.
+        
+        Masking strategy:
+        - Latent tokens can attend to each other (no mask within latent block)
+        - Recent tokens can attend to ALL latent tokens (they summarize past)
+        - Recent tokens use causal masking among themselves
+        - Latent tokens should NOT attend to recent tokens (maintains causality)
         
         Returns a boolean mask where True means "mask out" (don't attend).
         """
@@ -114,13 +118,17 @@ class CompressedAD(nn.Module):
         recent_start = self.n_compress_tokens
         recent_len = seq_len - recent_start
         
-        # Causal mask for recent tokens attending to each other
         if recent_len > 0:
+            # Causal mask for recent tokens attending to each other
             recent_mask = torch.triu(
                 torch.ones((recent_len, recent_len), dtype=torch.bool, device=self.device), 
                 diagonal=1
             )
             mask[recent_start:, recent_start:] = recent_mask
+            
+            # CRITICAL FIX: Latent tokens should NOT attend to recent tokens
+            # This maintains causality - latent tokens only summarize compressed history
+            mask[:recent_start, recent_start:] = True
         
         return mask
 
@@ -301,6 +309,9 @@ class CompressedAD(nn.Module):
     def forward(self, x):
         """
         Training forward pass with automatic compression for long sequences.
+        
+        All samples in batch have same context length (handled by collate_fn),
+        enabling fully batched GPU processing.
         """
         query_states = x['query_states'].to(self.device)
         target_actions = x['target_actions'].to(self.device)
@@ -318,7 +329,7 @@ class CompressedAD(nn.Module):
         context, _ = pack([states, actions, rewards, next_states], 'b n *')
         context_embed = self.embed_context(context)
 
-        # Forward with compression if needed (pass rewards for weighted reconstruction)
+        # Forward with compression (fully batched - all samples have same length)
         transformer_output, compression_info = self._forward_with_compression(
             context_embed, query_states_embed, rewards=rewards
         )

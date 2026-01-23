@@ -45,40 +45,110 @@ from env import make_env
 import numpy as np
 import torch.nn.functional as F
 from functools import partial
+import random
+
+
+# Global config that collate function can access
+# This is updated by the main training loop when curriculum changes
+_collate_config = {
+    'n_transit': 60,
+    'min_context': 50,
+    'max_context': 800,
+    'length_distribution': {'short': 0.6, 'medium': 0.35, 'long': 0.05, 'very_long': 0.0}
+}
+
+
+def update_collate_config(n_transit, min_context, max_context, length_distribution):
+    """Update the global collate config (called from main training loop)."""
+    global _collate_config
+    _collate_config['n_transit'] = n_transit
+    _collate_config['min_context'] = min_context
+    _collate_config['max_context'] = max_context
+    _collate_config['length_distribution'] = length_distribution.copy()
+
+
+def _sample_batch_context_length():
+    """Sample a context length for the entire batch based on current distribution."""
+    cfg = _collate_config
+    r = random.random()
+    cumulative = 0
+    
+    compression_trigger = cfg['n_transit'] - 1
+    
+    for category, prob in cfg['length_distribution'].items():
+        cumulative += prob
+        if r < cumulative:
+            if category == 'short':
+                low = max(20, cfg['min_context'])
+                high = min(compression_trigger - 10, compression_trigger - 1)
+            elif category == 'medium':
+                low = compression_trigger
+                high = min(int(compression_trigger * 2.5), cfg['max_context'])
+            elif category == 'long':
+                low = min(int(compression_trigger * 2.5), cfg['max_context'])
+                high = min(int(compression_trigger * 5), cfg['max_context'])
+            elif category == 'very_long':
+                low = min(int(compression_trigger * 5), cfg['max_context'])
+                high = cfg['max_context']
+            else:
+                low, high = cfg['min_context'], cfg['max_context']
+            
+            low = min(low, high)
+            return random.randint(low, high)
+    
+    return random.randint(cfg['min_context'], cfg['max_context'])
 
 
 def cad_collate_fn(batch, grid_size):
     """
-    Collate function for variable-length CAD dataset.
-    Handles sequences of different lengths by padding.
-    """
-    # Find max context length in batch
-    max_context_len = max(item['states'].shape[0] for item in batch)
+    Collate function for CAD dataset.
     
+    Samples ONE context length for the entire batch, ensuring:
+    1. All samples in batch have same length (efficient batched processing)
+    2. The curriculum length distribution is properly respected
+    3. Model sees full variety of sequence lengths across training
+    
+    IMPORTANT: When truncating, we keep the MOST RECENT context (closest to query).
+    The query state is the state we're predicting action for, so recent context is most relevant.
+    """
     batch_size = len(batch)
     dim_state = batch[0]['states'].shape[1]
     num_actions = 5  # Darkroom actions
     
-    # Initialize padded arrays
-    states = np.zeros((batch_size, max_context_len, dim_state), dtype=np.float32)
-    actions = np.zeros((batch_size, max_context_len), dtype=np.int64)
-    rewards = np.zeros((batch_size, max_context_len), dtype=np.float32)
-    next_states = np.zeros((batch_size, max_context_len, dim_state), dtype=np.float32)
+    # Sample a single context length for this entire batch
+    shared_context_len = _sample_batch_context_length()
+    
+    # Initialize arrays with uniform length
+    states = np.zeros((batch_size, shared_context_len, dim_state), dtype=np.float32)
+    actions = np.zeros((batch_size, shared_context_len), dtype=np.int64)
+    rewards = np.zeros((batch_size, shared_context_len), dtype=np.float32)
+    next_states = np.zeros((batch_size, shared_context_len, dim_state), dtype=np.float32)
     
     query_states = []
     target_actions = []
-    context_lengths = []
     
     for i, item in enumerate(batch):
-        ctx_len = item['states'].shape[0]
-        states[i, :ctx_len] = item['states']
-        actions[i, :ctx_len] = item['actions']
-        rewards[i, :ctx_len] = item['rewards']
-        next_states[i, :ctx_len] = item['next_states']
+        orig_len = item['states'].shape[0]
+        
+        if orig_len >= shared_context_len:
+            # Truncate: keep the MOST RECENT context (last shared_context_len transitions)
+            # These are the transitions immediately before the query state
+            start_idx = orig_len - shared_context_len
+            states[i] = item['states'][start_idx:]
+            actions[i] = item['actions'][start_idx:]
+            rewards[i] = item['rewards'][start_idx:]
+            next_states[i] = item['next_states'][start_idx:]
+        else:
+            # Item is shorter than needed - use all of it, pad at the BEGINNING
+            # Padding at beginning = "no history before this point"
+            pad_len = shared_context_len - orig_len
+            states[i, pad_len:] = item['states']
+            actions[i, pad_len:] = item['actions']
+            rewards[i, pad_len:] = item['rewards']
+            next_states[i, pad_len:] = item['next_states']
         
         query_states.append(item['query_states'])
         target_actions.append(item['target_actions'])
-        context_lengths.append(ctx_len)
     
     res = {
         'query_states': torch.tensor(np.array(query_states), requires_grad=False, dtype=torch.float),
@@ -87,15 +157,22 @@ def cad_collate_fn(batch, grid_size):
         'actions': F.one_hot(torch.tensor(actions, requires_grad=False, dtype=torch.long), num_classes=num_actions),
         'rewards': torch.tensor(rewards, dtype=torch.float, requires_grad=False),
         'next_states': torch.tensor(next_states, requires_grad=False, dtype=torch.float),
-        'context_lengths': torch.tensor(context_lengths, dtype=torch.long),  # For masking
     }
     
     return res
 
 
 def get_cad_data_loader(dataset, batch_size, config, shuffle=True):
-    """Data loader for CAD with variable-length collate function."""
+    """Data loader for CAD with batch-shared context length."""
     from torch.utils.data import DataLoader
+    
+    # Initialize global collate config
+    update_collate_config(
+        n_transit=config['n_transit'],
+        min_context=config.get('min_context_length', 50),
+        max_context=config.get('max_context_length', 800),
+        length_distribution=dataset.length_distribution
+    )
     
     collate_fn = partial(cad_collate_fn, grid_size=config['grid_size'])
     return DataLoader(
@@ -230,9 +307,15 @@ if __name__ == '__main__':
     curriculum = get_curriculum_from_config(config) if use_curriculum else [(0, None, DEFAULT_LENGTH_DISTRIBUTIONS[None])]
 
     # Initialize accelerator for multi-GPU support
+    # Note: find_unused_parameters=True is needed because compression_transformer
+    # and reconstruction_decoder are not used when sequences are short (no compression)
+    from accelerate import DistributedDataParallelKwargs
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    
     accelerator = Accelerator(
         mixed_precision=config['mixed_precision'],
         gradient_accumulation_steps=config.get('gradient_accumulation_steps', 1),
+        kwargs_handlers=[ddp_kwargs],
     )
     
     config['device'] = accelerator.device
@@ -429,6 +512,13 @@ if __name__ == '__main__':
                     current_curriculum_stage = new_stage
                     new_length_dist = get_curriculum_length_distribution(step, curriculum)
                     train_dataset.update_length_distribution(new_length_dist)
+                    # Also update the global collate config for batch-level length sampling
+                    update_collate_config(
+                        n_transit=config['n_transit'],
+                        min_context=config.get('min_context_length', 50),
+                        max_context=config.get('max_context_length', 800),
+                        length_distribution=new_length_dist
+                    )
                     if is_main:
                         print(f'\n[Step {step}] Curriculum stage {new_stage}: max_comp={max_comp}, '
                               f'length_dist={new_length_dist}')
