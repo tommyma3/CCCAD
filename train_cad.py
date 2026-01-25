@@ -51,20 +51,28 @@ import random
 # Global config that collate function can access
 # This is updated by the main training loop when curriculum changes
 _collate_config = {
-    'n_transit': 60,
+    'n_transit': 100,  # Updated to match typical config
     'min_context': 50,
-    'max_context': 800,
-    'length_distribution': {'short': 0.6, 'medium': 0.35, 'long': 0.05, 'very_long': 0.0}
+    'max_context': 1500,
+    'length_distribution': {'short': 0.3, 'medium': 0.55, 'long': 0.15, 'very_long': 0.0}
 }
 
 
-def update_collate_config(n_transit, min_context, max_context, length_distribution):
+def update_collate_config(n_transit, min_context, max_context, length_distribution, verbose=False):
     """Update the global collate config (called from main training loop)."""
     global _collate_config
     _collate_config['n_transit'] = n_transit
     _collate_config['min_context'] = min_context
     _collate_config['max_context'] = max_context
     _collate_config['length_distribution'] = length_distribution.copy()
+    
+    if verbose:
+        trigger = n_transit  # Minimum length that triggers compression
+        print(f"  Collate config updated:")
+        print(f"    n_transit={n_transit}, compression triggers at context_len >= {trigger}")
+        print(f"    short: {min_context}-{trigger-1}, medium: {trigger}-{int(trigger*2.5)}")
+        print(f"    long: {int(trigger*2.5)+1}-{int(trigger*5)}, very_long: {int(trigger*5)+1}-{max_context}")
+        print(f"    distribution: {length_distribution}")
 
 
 def _sample_batch_context_length():
@@ -73,22 +81,28 @@ def _sample_batch_context_length():
     r = random.random()
     cumulative = 0
     
-    compression_trigger = cfg['n_transit'] - 1
+    # Compression triggers when context_len > (n_transit - 1)
+    # So we need context_len >= n_transit to trigger compression
+    compression_trigger = cfg['n_transit']  # This is the MINIMUM length that triggers compression
     
     for category, prob in cfg['length_distribution'].items():
         cumulative += prob
         if r < cumulative:
             if category == 'short':
+                # No compression: context fits in n_transit - 1
                 low = max(20, cfg['min_context'])
-                high = min(compression_trigger - 10, compression_trigger - 1)
+                high = compression_trigger - 1  # max length without compression
             elif category == 'medium':
-                low = compression_trigger
+                # 1-2 compressions
+                low = compression_trigger  # minimum to trigger first compression
                 high = min(int(compression_trigger * 2.5), cfg['max_context'])
             elif category == 'long':
-                low = min(int(compression_trigger * 2.5), cfg['max_context'])
+                # 3-5 compressions
+                low = min(int(compression_trigger * 2.5) + 1, cfg['max_context'])
                 high = min(int(compression_trigger * 5), cfg['max_context'])
             elif category == 'very_long':
-                low = min(int(compression_trigger * 5), cfg['max_context'])
+                # 5+ compressions
+                low = min(int(compression_trigger * 5) + 1, cfg['max_context'])
                 high = cfg['max_context']
             else:
                 low, high = cfg['min_context'], cfg['max_context']
@@ -171,7 +185,8 @@ def get_cad_data_loader(dataset, batch_size, config, shuffle=True):
         n_transit=config['n_transit'],
         min_context=config.get('min_context_length', 50),
         max_context=config.get('max_context_length', 800),
-        length_distribution=dataset.length_distribution
+        length_distribution=dataset.length_distribution,
+        verbose=True  # Print config for verification
     )
     
     collate_fn = partial(cad_collate_fn, grid_size=config['grid_size'])
@@ -263,7 +278,19 @@ if __name__ == '__main__':
                        help='Model config name (without .yaml extension)')
     parser.add_argument('--env', type=str, default='darkroom',
                        help='Environment name: darkroom or dark_key_to_door')
+    parser.add_argument('--log_dir', type=str, default=None,
+                       help='Custom log directory (overrides default)')
+    parser.add_argument('--seed', type=int, default=None,
+                       help='Random seed (overrides config)')
     args = parser.parse_args()
+    
+    # Support environment variables for ablation scripts
+    if args.log_dir is None:
+        args.log_dir = os.environ.get('CAD_LOG_DIR', None)
+    if args.seed is None:
+        env_seed = os.environ.get('CAD_SEED', None)
+        if env_seed is not None:
+            args.seed = int(env_seed)
     
     multiprocessing.set_start_method('spawn', force=True)
     
@@ -281,10 +308,19 @@ if __name__ == '__main__':
     config.update(get_config(f'./config/algorithm/{alg_cfg}.yaml'))
     config.update(get_config(f'./config/model/{args.config}.yaml'))
 
+    # Override seed if specified
+    if args.seed is not None:
+        config['seed'] = args.seed
+        config['env_split_seed'] = args.seed
+
     # Set seed for reproducibility
     set_seed(config.get('seed', 42))
 
-    log_dir = path.join('./runs', f"CAD-{config['env']}-seed{config['env_split_seed']}")
+    # Use custom log_dir if provided, otherwise default
+    if args.log_dir:
+        log_dir = args.log_dir
+    else:
+        log_dir = path.join('./runs', f"CAD-{config['env']}-seed{config['env_split_seed']}")
     
     # Check if already exists
     config_save_path = path.join(log_dir, 'config.yaml')
@@ -334,27 +370,59 @@ if __name__ == '__main__':
         print(f'Train source timesteps: {config.get("train_source_timesteps", 1000)}')
         print(f'Train timesteps: {config.get("train_timesteps", 100000)}')
         
-        # Save config
+        # Save config (exclude non-serializable objects like torch.device)
+        config_to_save = {k: v for k, v in config.items() if not isinstance(v, torch.device)}
+        config_to_save['device'] = str(config['device'])  # Save device as string
         config_save_path = path.join(log_dir, 'config.yaml')
         with open(config_save_path, 'w') as f:
-            yaml.dump(config, f)
+            yaml.dump(config_to_save, f)
 
     # Create model
     model = MODEL[config['model']](config)
 
+    # Helper function to check pretrain compatibility
+    def check_pretrain_compatibility(pretrain_path, target_n_compress):
+        """Check if pretrained checkpoint is compatible with current n_compress_tokens."""
+        try:
+            ckpt = torch.load(pretrain_path, map_location='cpu')
+            pretrain_n_compress = ckpt.get('config', {}).get('n_compress_tokens', None)
+            
+            # Also check from the actual weight shape
+            if pretrain_n_compress is None:
+                for k, v in ckpt['model'].items():
+                    if 'compress_queries' in k:
+                        pretrain_n_compress = v.shape[1]
+                        break
+            
+            return pretrain_n_compress == target_n_compress, pretrain_n_compress
+        except Exception as e:
+            return False, None
+
     # Load pre-trained compression if available
     if args.pretrain_ckpt:
-        if is_main:
-            print(f'Loading pre-trained compression from {args.pretrain_ckpt}')
-        model.load_pretrained_compression(args.pretrain_ckpt)
+        compatible, pretrain_n = check_pretrain_compatibility(args.pretrain_ckpt, config['n_compress_tokens'])
+        if compatible:
+            if is_main:
+                print(f'Loading pre-trained compression from {args.pretrain_ckpt}')
+            model.load_pretrained_compression(args.pretrain_ckpt)
+        elif is_main:
+            print(f'WARNING: Pretrained compression has n_compress_tokens={pretrain_n}, '
+                  f'but current model has n_compress_tokens={config["n_compress_tokens"]}. '
+                  f'Training compression from scratch.')
     else:
         # Try to find pre-trained checkpoint automatically
         pretrain_dir = path.join('./runs', f"CAD-pretrain-{config['env']}-seed{config['env_split_seed']}")
         pretrain_path = path.join(pretrain_dir, 'pretrain-final.pt')
         if path.exists(pretrain_path):
-            if is_main:
-                print(f'Found pre-trained compression at {pretrain_path}')
-            model.load_pretrained_compression(pretrain_path)
+            compatible, pretrain_n = check_pretrain_compatibility(pretrain_path, config['n_compress_tokens'])
+            if compatible:
+                if is_main:
+                    print(f'Found pre-trained compression at {pretrain_path}')
+                model.load_pretrained_compression(pretrain_path)
+            elif is_main:
+                print(f'WARNING: Pretrained compression has n_compress_tokens={pretrain_n}, '
+                      f'but current model has n_compress_tokens={config["n_compress_tokens"]}. '
+                      f'Training compression from scratch.')
         elif is_main:
             print('WARNING: No pre-trained compression found. Training from scratch.')
 

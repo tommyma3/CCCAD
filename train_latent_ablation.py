@@ -1,0 +1,425 @@
+"""
+Direct training script for latent token ablation study.
+
+This script trains CAD models with different n_compress_tokens values
+sequentially in a single Python process. More reliable than subprocess calls.
+
+Usage:
+    python train_latent_ablation.py [--configs latent8 latent16] [--seed 0]
+"""
+
+import argparse
+import os
+import os.path as path
+import sys
+from datetime import datetime
+from glob import glob
+import gc
+
+import yaml
+import torch
+from torch.optim import AdamW
+from torch.utils.tensorboard import SummaryWriter
+from transformers import get_cosine_schedule_with_warmup
+from accelerate import Accelerator
+from accelerate.utils import set_seed
+from accelerate import DistributedDataParallelKwargs
+from tqdm import tqdm
+import multiprocessing
+import numpy as np
+import torch.nn.functional as F
+from functools import partial
+from stable_baselines3.common.vec_env import SubprocVecEnv
+
+from dataset import CompressedADDataset, ADDataset
+from env import SAMPLE_ENVIRONMENT, make_env
+from model import MODEL
+from utils import get_config, next_dataloader, get_curriculum_aware_scheduler, ad_collate_fn
+
+
+# Import curriculum and collate functions from train_cad
+from train_cad import (
+    get_curriculum_from_config,
+    get_curriculum_max_compressions,
+    get_curriculum_length_distribution,
+    get_curriculum_stage,
+    get_cad_data_loader,
+    update_collate_config,
+    DEFAULT_LENGTH_DISTRIBUTIONS,
+)
+
+
+# Ablation configurations: (suffix, n_compress_tokens)
+ABLATION_CONFIGS = {
+    'latent8': 8,
+    'latent16': 16,
+    'latent24': 24,
+    'latent32': 32,
+    'latent48': 48,
+}
+
+
+def train_single_config(config_suffix, seed, exp_dir='ablation_latent', env='darkroom'):
+    """Train a single ablation configuration."""
+    
+    config_name = f'cad_dr_{config_suffix}'
+    run_name = f'{config_name}-seed{seed}'
+    log_dir = path.join('./runs', exp_dir, run_name)
+    
+    print(f"\n{'='*70}")
+    print(f"Training: {run_name}")
+    print(f"Config: {config_name}")
+    print(f"n_compress_tokens: {ABLATION_CONFIGS[config_suffix]}")
+    print(f"Log dir: {log_dir}")
+    print(f"{'='*70}\n")
+    
+    # Load configs
+    env_config_map = {
+        'darkroom': ('darkroom', 'ppo_darkroom'),
+        'dark_key_to_door': ('dark_key_to_door', 'ppo_dark_key_to_door'),
+    }
+    env_cfg, alg_cfg = env_config_map[env]
+    
+    config = get_config(f'./config/env/{env_cfg}.yaml')
+    config.update(get_config(f'./config/algorithm/{alg_cfg}.yaml'))
+    config.update(get_config(f'./config/model/{config_name}.yaml'))
+    
+    # Override seed
+    config['seed'] = seed
+    config['env_split_seed'] = seed
+    
+    set_seed(seed)
+    
+    config['log_dir'] = log_dir
+    config['traj_dir'] = './datasets'
+    config['mixed_precision'] = 'fp16'
+    
+    # Curriculum
+    curriculum = get_curriculum_from_config(config)
+    
+    # Initialize accelerator
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator = Accelerator(
+        mixed_precision=config['mixed_precision'],
+        gradient_accumulation_steps=config.get('gradient_accumulation_steps', 1),
+        kwargs_handlers=[ddp_kwargs],
+    )
+    
+    config['device'] = accelerator.device
+    is_main = accelerator.is_main_process
+    
+    if is_main:
+        os.makedirs(log_dir, exist_ok=True)
+        writer = SummaryWriter(log_dir, flush_secs=15)
+        
+        # Save config (exclude non-serializable objects like torch.device)
+        config_to_save = {k: v for k, v in config.items() if not isinstance(v, torch.device)}
+        config_to_save['device'] = str(config['device'])  # Save device as string
+        with open(path.join(log_dir, 'config.yaml'), 'w') as f:
+            yaml.dump(config_to_save, f)
+        
+        print(f"n_transit: {config['n_transit']}")
+        print(f"n_compress_tokens: {config['n_compress_tokens']}")
+        print(f"Available space: {config['n_transit'] - config['n_compress_tokens'] - 1}")
+    
+    # Create model
+    model = MODEL[config['model']](config)
+    
+    # Try to load pretrained compression (only if n_compress_tokens matches)
+    pretrain_loaded = False
+    pretrain_path = None
+    
+    # Find pretrain checkpoint
+    pretrain_dir = path.join('./runs', f"CAD-pretrain-{config['env']}-seed{config['env_split_seed']}")
+    candidate_paths = [
+        path.join(pretrain_dir, 'pretrain-final.pt'),
+        path.join('./runs/latest', 'pretrain-final.pt'),
+    ]
+    
+    for p in candidate_paths:
+        if path.exists(p):
+            pretrain_path = p
+            break
+    
+    if pretrain_path:
+        # Check if n_compress_tokens matches before loading
+        try:
+            ckpt = torch.load(pretrain_path, map_location='cpu')
+            pretrain_n_compress = ckpt.get('config', {}).get('n_compress_tokens', None)
+            
+            # Also check from the actual weight shape
+            if pretrain_n_compress is None:
+                for k, v in ckpt['model'].items():
+                    if 'compress_queries' in k:
+                        pretrain_n_compress = v.shape[1]
+                        break
+            
+            if pretrain_n_compress == config['n_compress_tokens']:
+                if is_main:
+                    print(f'Loading pre-trained compression from {pretrain_path}')
+                model.load_pretrained_compression(pretrain_path)
+                pretrain_loaded = True
+            else:
+                if is_main:
+                    print(f'WARNING: Pretrained compression has n_compress_tokens={pretrain_n_compress}, '
+                          f'but current model has n_compress_tokens={config["n_compress_tokens"]}. '
+                          f'Training compression from scratch.')
+        except Exception as e:
+            if is_main:
+                print(f'WARNING: Could not load pretrain checkpoint: {e}. Training from scratch.')
+    else:
+        if is_main:
+            print('WARNING: No pre-trained compression found. Training from scratch.')
+    
+    # Create datasets
+    train_dataset = CompressedADDataset(
+        config, 
+        config['traj_dir'], 
+        'train', 
+        config['train_n_stream'], 
+        config['train_source_timesteps']
+    )
+    
+    test_dataset = ADDataset(
+        config, 
+        config['traj_dir'], 
+        'test', 
+        1, 
+        config['train_source_timesteps']
+    )
+    
+    train_dataloader = get_cad_data_loader(
+        train_dataset, 
+        batch_size=config['train_batch_size'], 
+        config=config, 
+        shuffle=True
+    )
+    train_dataloader = next_dataloader(train_dataloader)
+    
+    test_collate_fn = partial(ad_collate_fn, grid_size=config['grid_size'])
+    from torch.utils.data import DataLoader
+    test_dataloader = DataLoader(
+        test_dataset, 
+        batch_size=config['test_batch_size'], 
+        shuffle=False,
+        collate_fn=test_collate_fn,
+        num_workers=0,
+        persistent_workers=False
+    )
+    
+    # Optimizer and scheduler
+    optimizer = AdamW(
+        model.parameters(), 
+        lr=config['lr'], 
+        betas=(config['beta1'], config['beta2']), 
+        weight_decay=config['weight_decay']
+    )
+    
+    lr_sched = get_curriculum_aware_scheduler(
+        optimizer=optimizer,
+        curriculum=curriculum,
+        total_steps=config['train_timesteps'],
+        initial_warmup_steps=config.get('num_warmup_steps', 1000),
+        stage_warmup_steps=config.get('stage_warmup_steps', 500),
+        min_lr_ratio=config.get('min_lr_ratio', 0.1),
+    )
+    
+    step = 0
+    
+    # Check for existing checkpoint
+    ckpt_paths = sorted(glob(path.join(log_dir, 'ckpt-*.pt')))
+    if len(ckpt_paths) > 0:
+        ckpt_path = ckpt_paths[-1]
+        ckpt = torch.load(ckpt_path, map_location=config['device'])
+        model.load_state_dict(ckpt['model'])
+        optimizer.load_state_dict(ckpt['optimizer'])
+        lr_sched.load_state_dict(ckpt['lr_sched'])
+        step = ckpt['step']
+        if is_main:
+            print(f'Resumed from {ckpt_path} at step {step}')
+    
+    # Setup evaluation environments
+    env_name = config['env']
+    train_env_args, test_env_args = SAMPLE_ENVIRONMENT[env_name](config)
+    train_env_args = train_env_args[:10]
+    test_env_args = test_env_args[:10]
+    env_args = train_env_args + test_env_args
+    
+    envs = SubprocVecEnv([make_env(config, goal=arg) for arg in env_args])
+    
+    # Prepare for distributed training
+    model, optimizer, train_dataloader, lr_sched = accelerator.prepare(
+        model, optimizer, train_dataloader, lr_sched
+    )
+    
+    current_curriculum_stage = -1
+    best_eval_reward = -float('inf')
+    best_step = 0
+    compression_counts = []
+    
+    # Training loop
+    with tqdm(total=config['train_timesteps'], position=0, leave=True, disable=not is_main) as pbar:
+        pbar.update(step)
+        
+        while step < config['train_timesteps']:
+            batch = next(train_dataloader)
+            step += 1
+            
+            # Update curriculum
+            max_comp = get_curriculum_max_compressions(step, curriculum)
+            unwrapped = accelerator.unwrap_model(model)
+            unwrapped.set_curriculum(max_comp)
+            
+            new_stage = get_curriculum_stage(step, curriculum)
+            if new_stage != current_curriculum_stage:
+                current_curriculum_stage = new_stage
+                new_length_dist = get_curriculum_length_distribution(step, curriculum)
+                train_dataset.update_length_distribution(new_length_dist)
+                update_collate_config(
+                    n_transit=config['n_transit'],
+                    min_context=config.get('min_context_length', 50),
+                    max_context=config.get('max_context_length', 800),
+                    length_distribution=new_length_dist
+                )
+            
+            with accelerator.autocast():
+                output = model(batch)
+            
+            loss = output['loss_total']
+            compression_counts.append(output['num_compressions'])
+            if len(compression_counts) > 1000:
+                compression_counts.pop(0)
+            
+            accelerator.backward(loss)
+            accelerator.clip_grad_norm_(model.parameters(), config.get('grad_clip', 1.0))
+            optimizer.step()
+            lr_sched.step()
+            optimizer.zero_grad()
+            
+            pbar.update(1)
+            
+            # Logging
+            if step % 100 == 0 and is_main:
+                writer.add_scalar('train/loss', loss.item(), step)
+                writer.add_scalar('train/loss_action', output['loss_action'].item(), step)
+                writer.add_scalar('train/lr', lr_sched.get_last_lr()[0], step)
+                if output.get('loss_recon') is not None:
+                    writer.add_scalar('train/loss_recon', output['loss_recon'].item(), step)
+            
+            # Evaluation
+            if step % config.get('gen_interval', 5000) == 0:
+                if is_main:
+                    unwrapped = accelerator.unwrap_model(model)
+                    unwrapped.eval()
+                    
+                    with torch.no_grad():
+                        eval_output = unwrapped.evaluate_in_context(
+                            vec_env=envs,
+                            eval_timesteps=config['horizon'] * 20
+                        )
+                    
+                    eval_reward = np.mean(eval_output['reward_episode'])
+                    writer.add_scalar('eval/reward', eval_reward, step)
+                    
+                    if eval_reward > best_eval_reward:
+                        best_eval_reward = eval_reward
+                        best_step = step
+                        torch.save({
+                            'step': step,
+                            'model': unwrapped.state_dict(),
+                            'eval_reward': eval_reward,
+                            'config': config,
+                        }, path.join(log_dir, 'best-model.pt'))
+                    
+                    unwrapped.train()
+                    print(f"\n[Step {step}] Eval reward: {eval_reward:.4f} (best: {best_eval_reward:.4f} @ {best_step})")
+            
+            # Save checkpoint
+            if step % config.get('save_interval', 10000) == 0:
+                if is_main:
+                    unwrapped = accelerator.unwrap_model(model)
+                    torch.save({
+                        'step': step,
+                        'model': unwrapped.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        'lr_sched': lr_sched.state_dict(),
+                        'config': config,
+                    }, path.join(log_dir, f'ckpt-{step}.pt'))
+    
+    # Final save
+    if is_main:
+        unwrapped = accelerator.unwrap_model(model)
+        torch.save({
+            'step': step,
+            'model': unwrapped.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'lr_sched': lr_sched.state_dict(),
+            'config': config,
+        }, path.join(log_dir, f'ckpt-{step}.pt'))
+        
+        writer.close()
+    
+    # Cleanup
+    envs.close()
+    del model, optimizer, train_dataloader, train_dataset, test_dataset
+    gc.collect()
+    torch.cuda.empty_cache()
+    
+    return best_eval_reward
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Train latent token ablation study')
+    parser.add_argument('--configs', type=str, nargs='+', default=None,
+                       help='Specific configs to run: latent8, latent16, latent24, latent32, latent48')
+    parser.add_argument('--seed', type=int, default=0,
+                       help='Random seed')
+    parser.add_argument('--exp_dir', type=str, default='ablation_latent',
+                       help='Experiment directory under ./runs/')
+    parser.add_argument('--env', type=str, default='darkroom',
+                       help='Environment name')
+    args = parser.parse_args()
+    
+    multiprocessing.set_start_method('spawn', force=True)
+    
+    # Determine which configs to run
+    if args.configs:
+        configs = [c for c in args.configs if c in ABLATION_CONFIGS]
+    else:
+        configs = list(ABLATION_CONFIGS.keys())
+    
+    print(f"Latent Token Ablation Study")
+    print(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Configs: {configs}")
+    print(f"Seed: {args.seed}")
+    print(f"Environment: {args.env}")
+    
+    results = {}
+    
+    for config_suffix in configs:
+        try:
+            best_reward = train_single_config(
+                config_suffix=config_suffix,
+                seed=args.seed,
+                exp_dir=args.exp_dir,
+                env=args.env,
+            )
+            results[config_suffix] = best_reward
+        except Exception as e:
+            print(f"Error training {config_suffix}: {e}")
+            results[config_suffix] = None
+    
+    # Summary
+    print(f"\n{'='*70}")
+    print("ABLATION STUDY COMPLETE")
+    print(f"{'='*70}")
+    for config, reward in results.items():
+        n_tokens = ABLATION_CONFIGS[config]
+        if reward is not None:
+            print(f"  {config} (n_compress_tokens={n_tokens}): best_reward = {reward:.4f}")
+        else:
+            print(f"  {config} (n_compress_tokens={n_tokens}): FAILED")
+
+
+if __name__ == '__main__':
+    main()
