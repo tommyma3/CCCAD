@@ -44,8 +44,8 @@ from train_cad import (
     get_curriculum_length_distribution,
     get_curriculum_stage,
     get_cad_data_loader,
-    update_collate_config,
     DEFAULT_LENGTH_DISTRIBUTIONS,
+    cad_collate_fn,
 )
 
 
@@ -287,12 +287,8 @@ def train_single_config(config_suffix, seed, exp_dir='ablation_latent', env='dar
                 current_curriculum_stage = new_stage
                 new_length_dist = get_curriculum_length_distribution(step, curriculum)
                 train_dataset.update_length_distribution(new_length_dist)
-                update_collate_config(
-                    n_transit=config['n_transit'],
-                    min_context=config.get('min_context_length', 50),
-                    max_context=config.get('max_context_length', 800),
-                    length_distribution=new_length_dist
-                )
+                if is_main:
+                    print(f"\n[Stage {new_stage}] Updated length distribution: {new_length_dist}")
             
             with accelerator.autocast():
                 output = model(batch)

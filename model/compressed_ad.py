@@ -104,12 +104,8 @@ class CompressedAD(nn.Module):
     def _get_attention_mask_for_latent(self, seq_len):
         """
         Generate attention mask for sequences with latent prefix.
-        
-        Masking strategy:
-        - Latent tokens can attend to each other (no mask within latent block)
-        - Recent tokens can attend to ALL latent tokens (they summarize past)
-        - Recent tokens use causal masking among themselves
-        - Latent tokens should NOT attend to recent tokens (maintains causality)
+        All tokens can attend to latent tokens (first n_compress_tokens),
+        but recent tokens use causal masking among themselves.
         
         Returns a boolean mask where True means "mask out" (don't attend).
         """
@@ -118,17 +114,13 @@ class CompressedAD(nn.Module):
         recent_start = self.n_compress_tokens
         recent_len = seq_len - recent_start
         
+        # Causal mask for recent tokens attending to each other
         if recent_len > 0:
-            # Causal mask for recent tokens attending to each other
             recent_mask = torch.triu(
                 torch.ones((recent_len, recent_len), dtype=torch.bool, device=self.device), 
                 diagonal=1
             )
             mask[recent_start:, recent_start:] = recent_mask
-            
-            # CRITICAL FIX: Latent tokens should NOT attend to recent tokens
-            # This maintains causality - latent tokens only summarize compressed history
-            mask[:recent_start, recent_start:] = True
         
         return mask
 

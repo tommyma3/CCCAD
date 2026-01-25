@@ -31,16 +31,18 @@ class ADDataset(Dataset):
         else:
             raise ValueError(f'Invalid env: {self.env}')
 
-        # Note: collect.py saves data with train tasks first (indices 0 to n_train-1),
-        # then test tasks (indices n_train to n_total-1). No shuffle needed here.
+        total_env_idx = list(range(n_total_envs))
+        random.seed(config['env_split_seed'])
+        random.shuffle(total_env_idx)
+        
         n_train_envs = round(n_total_envs * config['train_env_ratio'])
         
         if mode == 'train':
-            env_idx = list(range(n_train_envs))
+            env_idx = total_env_idx[:n_train_envs]
         elif mode == 'test':
-            env_idx = list(range(n_train_envs, n_total_envs))
+            env_idx = total_env_idx[n_train_envs:]
         elif mode == 'all':
-            env_idx = list(range(n_total_envs))
+            env_idx = total_env_idx
         else:
             raise ValueError('Invalid mode')
 
@@ -53,17 +55,12 @@ class ADDataset(Dataset):
             for i in env_idx:
                 grp = f.get(f'{i}')
                 if grp is None:
-                    print(f'Warning: trajectory group "{i}" not found in {traj_dir}/{get_traj_file_name(config)}.hdf5; skipping')
-                    continue
-
+                    continue  # Skip missing trajectory groups
                 states.append(grp['states'][()].transpose(1, 0, 2)[:n_stream, :source_timesteps])
                 actions.append(grp['actions'][()].transpose(1, 0)[:n_stream, :source_timesteps])
                 rewards.append(grp['rewards'][()].transpose(1, 0)[:n_stream, :source_timesteps])
                 next_states.append(grp['next_states'][()].transpose(1, 0, 2)[:n_stream, :source_timesteps])
                     
-        if len(states) == 0:
-            raise RuntimeError(f'No trajectory groups found for mode="{mode}" in {traj_dir}/{get_traj_file_name(config)}.hdf5')
-
         self.states = np.concatenate(states, axis=0)
         self.actions = np.concatenate(actions, axis=0)
         self.rewards = np.concatenate(rewards, axis=0)
@@ -134,20 +131,22 @@ class CompressedADDataset(Dataset):
         if self.env == 'darkroom':
             n_total_envs = config['grid_size'] ** 2
         elif self.env == 'dark_key_to_door':
-            n_total_envs = config['grid_size'] ** 4  # All possible key/goal combinations
+            n_total_envs = min(200, config['grid_size'] ** 4)  # Limited to 200 tasks
         else:
             raise ValueError(f'Invalid environment: {self.env}')
 
-        # Note: collect.py saves data with train tasks first (indices 0 to n_train-1),
-        # then test tasks (indices n_train to n_total-1). No shuffle needed here.
+        total_env_idx = list(range(n_total_envs))
+        random.seed(config['env_split_seed'])
+        random.shuffle(total_env_idx)
+        
         n_train_envs = round(n_total_envs * config['train_env_ratio'])
         
         if mode == 'train':
-            env_idx = list(range(n_train_envs))
+            env_idx = total_env_idx[:n_train_envs]
         elif mode == 'test':
-            env_idx = list(range(n_train_envs, n_total_envs))
+            env_idx = total_env_idx[n_train_envs:]
         elif mode == 'all':
-            env_idx = list(range(n_total_envs))
+            env_idx = total_env_idx
         else:
             raise ValueError('Invalid mode')
 
@@ -160,17 +159,12 @@ class CompressedADDataset(Dataset):
             for i in env_idx:
                 grp = f.get(f'{i}')
                 if grp is None:
-                    print(f'Warning: trajectory group "{i}" not found in {traj_dir}/{get_traj_file_name(config)}.hdf5; skipping')
-                    continue
-
+                    continue  # Skip missing trajectory groups
                 states.append(grp['states'][()].transpose(1, 0, 2)[:n_stream, :source_timesteps])
                 actions.append(grp['actions'][()].transpose(1, 0)[:n_stream, :source_timesteps])
                 rewards.append(grp['rewards'][()].transpose(1, 0)[:n_stream, :source_timesteps])
                 next_states.append(grp['next_states'][()].transpose(1, 0, 2)[:n_stream, :source_timesteps])
                     
-        if len(states) == 0:
-            raise RuntimeError(f'No trajectory groups found for mode="{mode}" in {traj_dir}/{get_traj_file_name(config)}.hdf5')
-
         self.states = np.concatenate(states, axis=0)
         self.actions = np.concatenate(actions, axis=0)
         self.rewards = np.concatenate(rewards, axis=0)
@@ -210,34 +204,24 @@ class CompressedADDataset(Dataset):
         # Maximum available context (leave room for query state)
         max_available = self.seq_length - 1
         
-        # Calculate compression trigger point: when buffer fills up
-        # Available space = n_transit - n_compress_tokens (if has latent) - 1 (query)
-        # First compression triggers at ~(n_transit - 1) transitions
-        compression_trigger = self.n_transit - 1
-        
         for category, prob in self.length_distribution.items():
             cumulative += prob
             if r < cumulative:
                 if category == 'short':
-                    # No compression needed (fits in n_transit - 1)
-                    low = max(20, self.min_context)
-                    high = min(compression_trigger - 10, compression_trigger - 1)  # Stay below compression
+                    # No compression needed (fits in n_transit)
+                    low, high = 20, min(self.n_transit - 1, 50)
                 elif category == 'medium':
-                    # 1-2 compressions - spans 1x to 2.5x compression trigger
-                    low = compression_trigger
-                    high = min(int(compression_trigger * 2.5), self.max_context)
+                    # 1-2 compressions
+                    low, high = self.n_transit, min(150, self.max_context)
                 elif category == 'long':
-                    # 3-5 compressions - spans 2.5x to 5x compression trigger
-                    low = min(int(compression_trigger * 2.5), self.max_context)
-                    high = min(int(compression_trigger * 5), self.max_context)
+                    # 3-8 compressions
+                    low, high = 200, min(400, self.max_context)
                 elif category == 'very_long':
-                    # 5+ compressions - spans 5x+ compression trigger
-                    low = min(int(compression_trigger * 5), self.max_context)
-                    high = self.max_context
+                    # 10+ compressions
+                    low, high = 500, self.max_context
                 elif category == 'extended':
                     # Maximum compressions (requires longer dataset)
-                    low = min(int(compression_trigger * 8), self.max_context)
-                    high = self.max_context
+                    low, high = 800, self.max_context
                 else:
                     # Fallback for unknown categories
                     low, high = self.min_context, self.max_context
@@ -255,23 +239,18 @@ class CompressedADDataset(Dataset):
         # Use index for reproducibility but also allow randomness
         history_idx = i % self.n_histories
         
-        # CRITICAL: Sample a random END position within the trajectory
-        # This ensures the model sees the LEARNING PROGRESSION:
-        # - Early positions: agent is still exploring, making mistakes
-        # - Middle positions: agent is improving
-        # - Late positions: agent has learned good policy
-        # Without this, the model only sees expert behavior and can't learn in-context!
+        # Sample context length from distribution
+        context_length = self._sample_context_length()
         
-        # We need at least min_context transitions before end_idx
-        min_end = self.min_context
+        # Sample a valid end position (where we predict action)
         max_end = self.seq_length - 1
+        min_end = context_length
         
-        # Sample random end position
-        end_idx = random.randint(min_end, max_end)
+        if min_end >= max_end:
+            end_idx = max_end
+        else:
+            end_idx = random.randint(min_end, max_end)
         
-        # Calculate context length (from start to end_idx, exclusive of end_idx which is query)
-        # We return full available context; collate_fn will truncate based on curriculum
-        context_length = min(end_idx, self.max_context)
         start_idx = end_idx - context_length
         
         traj = {
@@ -281,6 +260,7 @@ class CompressedADDataset(Dataset):
             'actions': self.actions[history_idx, start_idx:end_idx],
             'rewards': self.rewards[history_idx, start_idx:end_idx],
             'next_states': self.next_states[history_idx, start_idx:end_idx],
+            'context_length': context_length,  # For logging/debugging
         }
         
         if self.dynamics:
@@ -309,20 +289,22 @@ class CompressionPretrainDataset(Dataset):
         if self.env == 'darkroom':
             n_total_envs = config['grid_size'] ** 2
         elif self.env == 'dark_key_to_door':
-            n_total_envs = config['grid_size'] ** 4  # All possible key/goal combinations
+            n_total_envs = min(200, config['grid_size'] ** 4)  # Limited to 200 tasks
         else:
             raise ValueError(f'Invalid env: {self.env}')
 
-        # Note: collect.py saves data with train tasks first (indices 0 to n_train-1),
-        # then test tasks (indices n_train to n_total-1). No shuffle needed here.
+        total_env_idx = list(range(n_total_envs))
+        random.seed(config['env_split_seed'])
+        random.shuffle(total_env_idx)
+        
         n_train_envs = round(n_total_envs * config['train_env_ratio'])
         
         if mode == 'train':
-            env_idx = list(range(n_train_envs))
+            env_idx = total_env_idx[:n_train_envs]
         elif mode == 'test':
-            env_idx = list(range(n_train_envs, n_total_envs))
+            env_idx = total_env_idx[n_train_envs:]
         elif mode == 'all':
-            env_idx = list(range(n_total_envs))
+            env_idx = total_env_idx
         else:
             raise ValueError('Invalid mode')
 
@@ -333,10 +315,13 @@ class CompressionPretrainDataset(Dataset):
 
         with h5py.File(f'{traj_dir}/{get_traj_file_name(config)}.hdf5', 'r') as f:
             for i in env_idx:
-                states.append(f[f'{i}']['states'][()].transpose(1, 0, 2)[:n_stream, :source_timesteps])
-                actions.append(f[f'{i}']['actions'][()].transpose(1, 0)[:n_stream, :source_timesteps])
-                rewards.append(f[f'{i}']['rewards'][()].transpose(1, 0)[:n_stream, :source_timesteps])
-                next_states.append(f[f'{i}']['next_states'][()].transpose(1, 0, 2)[:n_stream, :source_timesteps])
+                grp = f.get(f'{i}')
+                if grp is None:
+                    continue  # Skip missing trajectory groups
+                states.append(grp['states'][()].transpose(1, 0, 2)[:n_stream, :source_timesteps])
+                actions.append(grp['actions'][()].transpose(1, 0)[:n_stream, :source_timesteps])
+                rewards.append(grp['rewards'][()].transpose(1, 0)[:n_stream, :source_timesteps])
+                next_states.append(grp['next_states'][()].transpose(1, 0, 2)[:n_stream, :source_timesteps])
                     
         self.states = np.concatenate(states, axis=0)
         self.actions = np.concatenate(actions, axis=0)

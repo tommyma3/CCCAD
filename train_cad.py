@@ -45,124 +45,39 @@ from env import make_env
 import numpy as np
 import torch.nn.functional as F
 from functools import partial
-import random
 
 
-# Global config that collate function can access
-# This is updated by the main training loop when curriculum changes
-_collate_config = {
-    'n_transit': 100,  # Updated to match typical config
-    'min_context': 50,
-    'max_context': 1500,
-    'length_distribution': {'short': 0.3, 'medium': 0.55, 'long': 0.15, 'very_long': 0.0}
-}
-
-
-def update_collate_config(n_transit, min_context, max_context, length_distribution, verbose=False):
-    """Update the global collate config (called from main training loop)."""
-    global _collate_config
-    _collate_config['n_transit'] = n_transit
-    _collate_config['min_context'] = min_context
-    _collate_config['max_context'] = max_context
-    _collate_config['length_distribution'] = length_distribution.copy()
-    
-    if verbose:
-        trigger = n_transit  # Minimum length that triggers compression
-        print(f"  Collate config updated:")
-        print(f"    n_transit={n_transit}, compression triggers at context_len >= {trigger}")
-        print(f"    short: {min_context}-{trigger-1}, medium: {trigger}-{int(trigger*2.5)}")
-        print(f"    long: {int(trigger*2.5)+1}-{int(trigger*5)}, very_long: {int(trigger*5)+1}-{max_context}")
-        print(f"    distribution: {length_distribution}")
-
-
-def _sample_batch_context_length():
-    """Sample a context length for the entire batch based on current distribution."""
-    cfg = _collate_config
-    r = random.random()
-    cumulative = 0
-    
-    # Compression triggers when context_len > (n_transit - 1)
-    # So we need context_len >= n_transit to trigger compression
-    compression_trigger = cfg['n_transit']  # This is the MINIMUM length that triggers compression
-    
-    for category, prob in cfg['length_distribution'].items():
-        cumulative += prob
-        if r < cumulative:
-            if category == 'short':
-                # No compression: context fits in n_transit - 1
-                low = max(20, cfg['min_context'])
-                high = compression_trigger - 1  # max length without compression
-            elif category == 'medium':
-                # 1-2 compressions
-                low = compression_trigger  # minimum to trigger first compression
-                high = min(int(compression_trigger * 2.5), cfg['max_context'])
-            elif category == 'long':
-                # 3-5 compressions
-                low = min(int(compression_trigger * 2.5) + 1, cfg['max_context'])
-                high = min(int(compression_trigger * 5), cfg['max_context'])
-            elif category == 'very_long':
-                # 5+ compressions
-                low = min(int(compression_trigger * 5) + 1, cfg['max_context'])
-                high = cfg['max_context']
-            else:
-                low, high = cfg['min_context'], cfg['max_context']
-            
-            low = min(low, high)
-            return random.randint(low, high)
-    
-    return random.randint(cfg['min_context'], cfg['max_context'])
-
-
-def cad_collate_fn(batch, grid_size):
+def cad_collate_fn(batch, grid_size, num_actions=5):
     """
-    Collate function for CAD dataset.
-    
-    Samples ONE context length for the entire batch, ensuring:
-    1. All samples in batch have same length (efficient batched processing)
-    2. The curriculum length distribution is properly respected
-    3. Model sees full variety of sequence lengths across training
-    
-    IMPORTANT: When truncating, we keep the MOST RECENT context (closest to query).
-    The query state is the state we're predicting action for, so recent context is most relevant.
+    Collate function for variable-length CAD dataset.
+    Handles sequences of different lengths by padding.
     """
+    # Find max context length in batch
+    max_context_len = max(item['states'].shape[0] for item in batch)
+    
     batch_size = len(batch)
     dim_state = batch[0]['states'].shape[1]
-    num_actions = 5  # Darkroom actions
     
-    # Sample a single context length for this entire batch
-    shared_context_len = _sample_batch_context_length()
-    
-    # Initialize arrays with uniform length
-    states = np.zeros((batch_size, shared_context_len, dim_state), dtype=np.float32)
-    actions = np.zeros((batch_size, shared_context_len), dtype=np.int64)
-    rewards = np.zeros((batch_size, shared_context_len), dtype=np.float32)
-    next_states = np.zeros((batch_size, shared_context_len, dim_state), dtype=np.float32)
+    # Initialize padded arrays
+    states = np.zeros((batch_size, max_context_len, dim_state), dtype=np.float32)
+    actions = np.zeros((batch_size, max_context_len), dtype=np.int64)
+    rewards = np.zeros((batch_size, max_context_len), dtype=np.float32)
+    next_states = np.zeros((batch_size, max_context_len, dim_state), dtype=np.float32)
     
     query_states = []
     target_actions = []
+    context_lengths = []
     
     for i, item in enumerate(batch):
-        orig_len = item['states'].shape[0]
-        
-        if orig_len >= shared_context_len:
-            # Truncate: keep the MOST RECENT context (last shared_context_len transitions)
-            # These are the transitions immediately before the query state
-            start_idx = orig_len - shared_context_len
-            states[i] = item['states'][start_idx:]
-            actions[i] = item['actions'][start_idx:]
-            rewards[i] = item['rewards'][start_idx:]
-            next_states[i] = item['next_states'][start_idx:]
-        else:
-            # Item is shorter than needed - use all of it, pad at the BEGINNING
-            # Padding at beginning = "no history before this point"
-            pad_len = shared_context_len - orig_len
-            states[i, pad_len:] = item['states']
-            actions[i, pad_len:] = item['actions']
-            rewards[i, pad_len:] = item['rewards']
-            next_states[i, pad_len:] = item['next_states']
+        ctx_len = item['states'].shape[0]
+        states[i, :ctx_len] = item['states']
+        actions[i, :ctx_len] = item['actions']
+        rewards[i, :ctx_len] = item['rewards']
+        next_states[i, :ctx_len] = item['next_states']
         
         query_states.append(item['query_states'])
         target_actions.append(item['target_actions'])
+        context_lengths.append(ctx_len)
     
     res = {
         'query_states': torch.tensor(np.array(query_states), requires_grad=False, dtype=torch.float),
@@ -171,25 +86,17 @@ def cad_collate_fn(batch, grid_size):
         'actions': F.one_hot(torch.tensor(actions, requires_grad=False, dtype=torch.long), num_classes=num_actions),
         'rewards': torch.tensor(rewards, dtype=torch.float, requires_grad=False),
         'next_states': torch.tensor(next_states, requires_grad=False, dtype=torch.float),
+        'context_lengths': torch.tensor(context_lengths, dtype=torch.long),  # For masking
     }
     
     return res
 
 
 def get_cad_data_loader(dataset, batch_size, config, shuffle=True):
-    """Data loader for CAD with batch-shared context length."""
+    """Data loader for CAD with variable-length collate function."""
     from torch.utils.data import DataLoader
     
-    # Initialize global collate config
-    update_collate_config(
-        n_transit=config['n_transit'],
-        min_context=config.get('min_context_length', 50),
-        max_context=config.get('max_context_length', 800),
-        length_distribution=dataset.length_distribution,
-        verbose=True  # Print config for verification
-    )
-    
-    collate_fn = partial(cad_collate_fn, grid_size=config['grid_size'])
+    collate_fn = partial(cad_collate_fn, grid_size=config['grid_size'], num_actions=config['num_actions'])
     return DataLoader(
         dataset, 
         batch_size=batch_size, 
@@ -278,49 +185,25 @@ if __name__ == '__main__':
                        help='Model config name (without .yaml extension)')
     parser.add_argument('--env', type=str, default='darkroom',
                        help='Environment name: darkroom or dark_key_to_door')
-    parser.add_argument('--log_dir', type=str, default=None,
-                       help='Custom log directory (overrides default)')
-    parser.add_argument('--seed', type=int, default=None,
-                       help='Random seed (overrides config)')
     args = parser.parse_args()
-    
-    # Support environment variables for ablation scripts
-    if args.log_dir is None:
-        args.log_dir = os.environ.get('CAD_LOG_DIR', None)
-    if args.seed is None:
-        env_seed = os.environ.get('CAD_SEED', None)
-        if env_seed is not None:
-            args.seed = int(env_seed)
     
     multiprocessing.set_start_method('spawn', force=True)
     
-    # Determine config files based on environment
-    env_config_map = {
-        'darkroom': ('darkroom', 'ppo_darkroom'),
-        'dark_key_to_door': ('dark_key_to_door', 'ppo_dark_key_to_door'),
-    }
-    if args.env not in env_config_map:
+    # Load configs based on environment
+    if args.env == 'darkroom':
+        config = get_config('./config/env/darkroom.yaml')
+        config.update(get_config('./config/algorithm/ppo_darkroom.yaml'))
+    elif args.env == 'dark_key_to_door':
+        config = get_config('./config/env/dark_key_to_door.yaml')
+        config.update(get_config('./config/algorithm/ppo_dark_key_to_door.yaml'))
+    else:
         raise ValueError(f'Unknown environment: {args.env}')
-    env_cfg, alg_cfg = env_config_map[args.env]
-    
-    # Load configs
-    config = get_config(f'./config/env/{env_cfg}.yaml')
-    config.update(get_config(f'./config/algorithm/{alg_cfg}.yaml'))
     config.update(get_config(f'./config/model/{args.config}.yaml'))
-
-    # Override seed if specified
-    if args.seed is not None:
-        config['seed'] = args.seed
-        config['env_split_seed'] = args.seed
 
     # Set seed for reproducibility
     set_seed(config.get('seed', 42))
 
-    # Use custom log_dir if provided, otherwise default
-    if args.log_dir:
-        log_dir = args.log_dir
-    else:
-        log_dir = path.join('./runs', f"CAD-{config['env']}-seed{config['env_split_seed']}")
+    log_dir = path.join('./runs', f"CAD-{config['env']}-seed{config['env_split_seed']}")
     
     # Check if already exists
     config_save_path = path.join(log_dir, 'config.yaml')
@@ -343,15 +226,9 @@ if __name__ == '__main__':
     curriculum = get_curriculum_from_config(config) if use_curriculum else [(0, None, DEFAULT_LENGTH_DISTRIBUTIONS[None])]
 
     # Initialize accelerator for multi-GPU support
-    # Note: find_unused_parameters=True is needed because compression_transformer
-    # and reconstruction_decoder are not used when sequences are short (no compression)
-    from accelerate import DistributedDataParallelKwargs
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-    
     accelerator = Accelerator(
         mixed_precision=config['mixed_precision'],
         gradient_accumulation_steps=config.get('gradient_accumulation_steps', 1),
-        kwargs_handlers=[ddp_kwargs],
     )
     
     config['device'] = accelerator.device
@@ -370,59 +247,27 @@ if __name__ == '__main__':
         print(f'Train source timesteps: {config.get("train_source_timesteps", 1000)}')
         print(f'Train timesteps: {config.get("train_timesteps", 100000)}')
         
-        # Save config (exclude non-serializable objects like torch.device)
-        config_to_save = {k: v for k, v in config.items() if not isinstance(v, torch.device)}
-        config_to_save['device'] = str(config['device'])  # Save device as string
+        # Save config
         config_save_path = path.join(log_dir, 'config.yaml')
         with open(config_save_path, 'w') as f:
-            yaml.dump(config_to_save, f)
+            yaml.dump(config, f)
 
     # Create model
     model = MODEL[config['model']](config)
 
-    # Helper function to check pretrain compatibility
-    def check_pretrain_compatibility(pretrain_path, target_n_compress):
-        """Check if pretrained checkpoint is compatible with current n_compress_tokens."""
-        try:
-            ckpt = torch.load(pretrain_path, map_location='cpu')
-            pretrain_n_compress = ckpt.get('config', {}).get('n_compress_tokens', None)
-            
-            # Also check from the actual weight shape
-            if pretrain_n_compress is None:
-                for k, v in ckpt['model'].items():
-                    if 'compress_queries' in k:
-                        pretrain_n_compress = v.shape[1]
-                        break
-            
-            return pretrain_n_compress == target_n_compress, pretrain_n_compress
-        except Exception as e:
-            return False, None
-
     # Load pre-trained compression if available
     if args.pretrain_ckpt:
-        compatible, pretrain_n = check_pretrain_compatibility(args.pretrain_ckpt, config['n_compress_tokens'])
-        if compatible:
-            if is_main:
-                print(f'Loading pre-trained compression from {args.pretrain_ckpt}')
-            model.load_pretrained_compression(args.pretrain_ckpt)
-        elif is_main:
-            print(f'WARNING: Pretrained compression has n_compress_tokens={pretrain_n}, '
-                  f'but current model has n_compress_tokens={config["n_compress_tokens"]}. '
-                  f'Training compression from scratch.')
+        if is_main:
+            print(f'Loading pre-trained compression from {args.pretrain_ckpt}')
+        model.load_pretrained_compression(args.pretrain_ckpt)
     else:
         # Try to find pre-trained checkpoint automatically
         pretrain_dir = path.join('./runs', f"CAD-pretrain-{config['env']}-seed{config['env_split_seed']}")
         pretrain_path = path.join(pretrain_dir, 'pretrain-final.pt')
         if path.exists(pretrain_path):
-            compatible, pretrain_n = check_pretrain_compatibility(pretrain_path, config['n_compress_tokens'])
-            if compatible:
-                if is_main:
-                    print(f'Found pre-trained compression at {pretrain_path}')
-                model.load_pretrained_compression(pretrain_path)
-            elif is_main:
-                print(f'WARNING: Pretrained compression has n_compress_tokens={pretrain_n}, '
-                      f'but current model has n_compress_tokens={config["n_compress_tokens"]}. '
-                      f'Training compression from scratch.')
+            if is_main:
+                print(f'Found pre-trained compression at {pretrain_path}')
+            model.load_pretrained_compression(pretrain_path)
         elif is_main:
             print('WARNING: No pre-trained compression found. Training from scratch.')
 
@@ -580,13 +425,6 @@ if __name__ == '__main__':
                     current_curriculum_stage = new_stage
                     new_length_dist = get_curriculum_length_distribution(step, curriculum)
                     train_dataset.update_length_distribution(new_length_dist)
-                    # Also update the global collate config for batch-level length sampling
-                    update_collate_config(
-                        n_transit=config['n_transit'],
-                        min_context=config.get('min_context_length', 50),
-                        max_context=config.get('max_context_length', 800),
-                        length_distribution=new_length_dist
-                    )
                     if is_main:
                         print(f'\n[Step {step}] Curriculum stage {new_stage}: max_comp={max_comp}, '
                               f'length_dist={new_length_dist}')
