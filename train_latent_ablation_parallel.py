@@ -33,24 +33,22 @@ def run_single_experiment(config_suffix, seed, gpu_id, exp_dir='ablation_latent'
     Run a single ablation experiment on a specific GPU.
     
     This function is called in a separate process.
+    Uses train_latent_ablation.py with all the fixes applied.
     """
-    config_name = f'cad_dr_{config_suffix}'
-    run_name = f'{config_name}-seed{seed}'
-    log_dir = os.path.join('./runs', exp_dir, run_name)
-    
     # Set CUDA device for this process
     env_vars = os.environ.copy()
     env_vars['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
     
+    # Use train_latent_ablation.py with single config
     cmd = [
-        sys.executable, 'train_cad.py',
-        '--config', config_name,
+        sys.executable, 'train_latent_ablation.py',
+        '--configs', config_suffix,
         '--env', env,
-        '--log_dir', log_dir,
+        '--exp_dir', exp_dir,
         '--seed', str(seed),
     ]
     
-    print(f"[GPU {gpu_id}] Starting {run_name}")
+    print(f"[GPU {gpu_id}] Starting {config_suffix} (n_compress_tokens={ABLATION_CONFIGS[config_suffix]})")
     
     try:
         result = subprocess.run(
@@ -61,15 +59,15 @@ def run_single_experiment(config_suffix, seed, gpu_id, exp_dir='ablation_latent'
         )
         
         if result.returncode == 0:
-            print(f"[GPU {gpu_id}] ✓ {run_name} completed successfully")
+            print(f"[GPU {gpu_id}] ✓ {config_suffix} completed successfully")
             return (config_suffix, seed, gpu_id, True, None)
         else:
             error_msg = result.stderr[-500:] if result.stderr else "Unknown error"
-            print(f"[GPU {gpu_id}] ✗ {run_name} failed: {error_msg}")
+            print(f"[GPU {gpu_id}] ✗ {config_suffix} failed: {error_msg}")
             return (config_suffix, seed, gpu_id, False, error_msg)
             
     except Exception as e:
-        print(f"[GPU {gpu_id}] ✗ {run_name} exception: {e}")
+        print(f"[GPU {gpu_id}] ✗ {config_suffix} exception: {e}")
         return (config_suffix, seed, gpu_id, False, str(e))
 
 

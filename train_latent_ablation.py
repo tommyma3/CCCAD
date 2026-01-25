@@ -245,17 +245,29 @@ def train_single_config(config_suffix, seed, exp_dir='ablation_latent', env='dar
     test_env_args = test_env_args[:10]
     env_args = train_env_args + test_env_args
     
-    envs = SubprocVecEnv([make_env(config, goal=arg) for arg in env_args])
+    if env_name == "darkroom":
+        envs = SubprocVecEnv([make_env(config, goal=arg) for arg in env_args])
+    elif env_name == "dark_key_to_door":
+        envs = SubprocVecEnv([make_env(config, key=arg[:2], goal=arg[2:]) for arg in env_args])
+    else:
+        raise NotImplementedError(f'Environment not supported: {env_name}')
     
     # Prepare for distributed training
     model, optimizer, train_dataloader, lr_sched = accelerator.prepare(
         model, optimizer, train_dataloader, lr_sched
     )
     
+    if is_main:
+        start_time = datetime.now()
+        print(f'Training started at {start_time}')
+    
     current_curriculum_stage = -1
     best_eval_reward = -float('inf')
     best_step = 0
     compression_counts = []
+    patience_counter = 0
+    patience = config.get('early_stopping_patience', 5)
+    save_best_model = config.get('save_best_model', True)
     
     # Training loop
     with tqdm(total=config['train_timesteps'], position=0, leave=True, disable=not is_main) as pbar:
@@ -290,32 +302,88 @@ def train_single_config(config_suffix, seed, exp_dir='ablation_latent', env='dar
             if len(compression_counts) > 1000:
                 compression_counts.pop(0)
             
+            # Correct order: zero_grad -> backward -> clip -> step
+            optimizer.zero_grad()
             accelerator.backward(loss)
             accelerator.clip_grad_norm_(model.parameters(), config.get('grad_clip', 1.0))
             optimizer.step()
-            lr_sched.step()
-            optimizer.zero_grad()
             
-            pbar.update(1)
+            if not accelerator.optimizer_step_was_skipped:
+                lr_sched.step()
             
-            # Logging
-            if step % 100 == 0 and is_main:
+            avg_compressions = np.mean(compression_counts) if compression_counts else 0
+            pbar.set_postfix(
+                loss=loss.item(), 
+                acc=output['acc_action'].item(),
+                n_comp=output['num_compressions'],
+                avg_comp=f'{avg_compressions:.2f}'
+            )
+            
+            # Logging (use summary_interval from config like original)
+            if step % config.get('summary_interval', 100) == 0 and is_main:
                 writer.add_scalar('train/loss', loss.item(), step)
                 writer.add_scalar('train/loss_action', output['loss_action'].item(), step)
                 writer.add_scalar('train/lr', lr_sched.get_last_lr()[0], step)
+                writer.add_scalar('train/acc_action', output['acc_action'].item(), step)
+                writer.add_scalar('train/num_compressions', output['num_compressions'], step)
+                writer.add_scalar('train/avg_compressions', avg_compressions, step)
                 if output.get('loss_recon') is not None:
                     writer.add_scalar('train/loss_recon', output['loss_recon'].item(), step)
+                
+                # Log curriculum stats if using curriculum
+                if curriculum:
+                    curr_max = get_curriculum_max_compressions(step, curriculum)
+                    writer.add_scalar('train/curriculum_max_compressions', 
+                                    curr_max if curr_max is not None else -1, step)
+                    writer.add_scalar('train/curriculum_stage', current_curriculum_stage, step)
+                    
+                    # Log length distribution
+                    curr_dist = get_curriculum_length_distribution(step, curriculum)
+                    for category, prob in curr_dist.items():
+                        writer.add_scalar(f'train/length_dist_{category}', prob, step)
             
-            # Evaluation
-            if step % config.get('gen_interval', 5000) == 0:
+            # Test dataloader evaluation (use eval_interval from config)
+            if is_main and step % config.get('eval_interval', 1000) == 0:
+                torch.cuda.empty_cache()
+                model.eval()
+                eval_start_time = datetime.now()
+                
+                with torch.no_grad():
+                    test_loss_action = 0.0
+                    test_acc_action = 0.0
+                    test_cnt = 0
+
+                    for j, test_batch in enumerate(test_dataloader):
+                        test_output = model(test_batch)
+                        cnt = len(test_batch['states'])
+                        test_loss_action += test_output['loss_action'].item() * cnt
+                        test_acc_action += test_output['acc_action'].item() * cnt
+                        test_cnt += cnt
+
+                writer.add_scalar('test/loss_action', test_loss_action / test_cnt, step)
+                writer.add_scalar('test/acc_action', test_acc_action / test_cnt, step)
+
+                eval_end_time = datetime.now()
+                print(f'\n[Test eval] loss={test_loss_action/test_cnt:.4f}, acc={test_acc_action/test_cnt:.4f}, time={eval_end_time - eval_start_time}')
+                
+                # Clean up evaluation tensors
+                del test_output, test_batch
+                
+                model.train()
+                torch.cuda.empty_cache()
+                gc.collect()
+            
+            # Evaluation (matches original train_cad.py)
+            if step % config.get('gen_interval', 10000) == 0:
                 if is_main:
+                    torch.cuda.empty_cache()
                     unwrapped = accelerator.unwrap_model(model)
                     unwrapped.eval()
                     
                     with torch.no_grad():
                         eval_output = unwrapped.evaluate_in_context(
                             vec_env=envs,
-                            eval_timesteps=config['horizon'] * 20
+                            eval_timesteps=config['horizon'] * 100  # 100 episodes like original
                         )
                     
                     eval_reward = np.mean(eval_output['reward_episode'])
@@ -330,12 +398,18 @@ def train_single_config(config_suffix, seed, exp_dir='ablation_latent', env='dar
                             'eval_reward': eval_reward,
                             'config': config,
                         }, path.join(log_dir, 'best-model.pt'))
+                        print(f'New best model saved! reward={eval_reward:.3f} at step {step}')
                     
                     unwrapped.train()
                     print(f"\n[Step {step}] Eval reward: {eval_reward:.4f} (best: {best_eval_reward:.4f} @ {best_step})")
+                    
+                    # Cleanup after evaluation
+                    del eval_output
+                    torch.cuda.empty_cache()
+                    gc.collect()
             
-            # Save checkpoint
-            if step % config.get('save_interval', 10000) == 0:
+            # Save checkpoint (use ckpt_interval from config like original)
+            if step % config.get('ckpt_interval', 1000) == 0:
                 if is_main:
                     unwrapped = accelerator.unwrap_model(model)
                     torch.save({
@@ -345,6 +419,8 @@ def train_single_config(config_suffix, seed, exp_dir='ablation_latent', env='dar
                         'lr_sched': lr_sched.state_dict(),
                         'config': config,
                     }, path.join(log_dir, f'ckpt-{step}.pt'))
+            
+            pbar.update(1)
     
     # Final save
     if is_main:
