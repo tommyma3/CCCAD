@@ -28,7 +28,7 @@ ABLATION_CONFIGS = {
 }
 
 
-def run_single_experiment(config_suffix, seed, gpu_id, exp_dir='ablation_transit'):
+def run_single_experiment(config_suffix, seed, gpu_id, exp_dir='ablation_transit', env='darkroom'):
     """
     Run a single ablation experiment on a specific GPU.
     
@@ -45,6 +45,7 @@ def run_single_experiment(config_suffix, seed, gpu_id, exp_dir='ablation_transit
         '--configs', config_suffix,
         '--exp_dir', exp_dir,
         '--seed', str(seed),
+        '--env', env,
     ]
     
     print(f"[GPU {gpu_id}] Starting {config_suffix} (n_transit={ABLATION_CONFIGS[config_suffix]})")
@@ -80,6 +81,8 @@ def main():
                        help='Random seed')
     parser.add_argument('--exp_dir', type=str, default='ablation_transit',
                        help='Experiment directory under ./runs/')
+    parser.add_argument('--env', type=str, default='darkroom',
+                       help='Environment name')
     args = parser.parse_args()
     
     # Determine which configs to run
@@ -99,6 +102,7 @@ def main():
     print(f"Configs: {configs}")
     print(f"Seed: {args.seed}")
     print(f"n_compress_tokens: 16 (fixed)")
+    print(f"Environment: {args.env}")
     print(f"=" * 70)
     
     # Create experiment directory
@@ -108,10 +112,10 @@ def main():
     tasks = []
     for i, config_suffix in enumerate(configs):
         gpu_id = args.gpus[i % n_gpus]
-        tasks.append((config_suffix, args.seed, gpu_id, args.exp_dir))
+        tasks.append((config_suffix, args.seed, gpu_id, args.exp_dir, args.env))
     
     print(f"\nTask assignments:")
-    for config_suffix, seed, gpu_id, exp_dir in tasks:
+    for config_suffix, seed, gpu_id, exp_dir, env in tasks:
         print(f"  {config_suffix} (n_transit={ABLATION_CONFIGS[config_suffix]}) -> GPU {gpu_id}")
     print()
     
@@ -128,11 +132,11 @@ def main():
         
         # Submit initial batch of tasks (one per GPU)
         while task_queue and len(futures) < max_workers:
-            config_suffix, seed, gpu_id, exp_dir = task_queue.pop(0)
+            config_suffix, seed, gpu_id, exp_dir, env = task_queue.pop(0)
             if gpu_id not in gpu_in_use:
                 future = executor.submit(
                     run_single_experiment,
-                    config_suffix, seed, gpu_id, exp_dir
+                    config_suffix, seed, gpu_id, exp_dir, env
                 )
                 futures[future] = (config_suffix, gpu_id)
                 gpu_in_use.add(gpu_id)
@@ -158,12 +162,12 @@ def main():
                 
                 # Submit next task for this GPU if available
                 for i, task in enumerate(task_queue):
-                    t_config, t_seed, t_gpu, t_exp = task
+                    t_config, t_seed, t_gpu, t_exp, t_env = task
                     if t_gpu == gpu_id or t_gpu not in gpu_in_use:
                         task_queue.pop(i)
                         new_future = executor.submit(
                             run_single_experiment,
-                            t_config, t_seed, t_gpu, t_exp
+                            t_config, t_seed, t_gpu, t_exp, t_env
                         )
                         futures[new_future] = (t_config, t_gpu)
                         gpu_in_use.add(t_gpu)
