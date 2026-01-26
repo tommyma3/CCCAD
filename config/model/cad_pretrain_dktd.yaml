@@ -3,7 +3,7 @@ include: config/model/ad_base.yaml
 model: CompressedAD
 
 # Compression Transformer (must match cad_dktd.yaml)
-tf_n_embd: 64           # Match cad_dktd.yaml and AD baseline
+tf_n_embd: 32           # Match cad_dktd.yaml and AD baseline
 tf_n_layer: 4           # Match cad_dktd.yaml  
 tf_n_head: 4            # Match cad_dktd.yaml
 tf_dropout: 0.1
@@ -12,7 +12,7 @@ tf_n_inner: 128         # Match cad_dktd.yaml
 n_transit: 100           # Match cad_dktd.yaml - larger for complex task
 
 # Compression Settings (must match cad_dktd.yaml)
-n_compress_tokens: 48   # Match cad_dktd.yaml
+n_compress_tokens: 36   # Match cad_dktd.yaml
 compress_n_layers: 4    # Match cad_dktd.yaml
 compress_n_heads: 4     # Match cad_dktd.yaml
 
